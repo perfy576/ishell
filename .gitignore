@@ -1,0 +1,6 @@
+# Local build artifacts
+/ishell
+/ishell.exe
+
+# Test coverage output
+/coverage.out
