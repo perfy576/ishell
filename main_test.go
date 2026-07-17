@@ -379,6 +379,28 @@ func TestNumericShortcutsActivateShellAndCommandGroups(t *testing.T) {
 	}
 }
 
+func TestDeleteQuickCommandAndProtectNonEmptyCommandGroup(t *testing.T) {
+	dir := t.TempDir()
+	s := &store{dir: dir, vaultPath: filepath.Join(dir, "vault.json"), key: bytes.Repeat([]byte{1}, 32), salt: bytes.Repeat([]byte{2}, 16), password: true}
+	m := newModel(s, vaultData{Commands: []quickCommand{{ID: "command", Name: "Command", Command: "echo ok", Platform: runtime.GOOS}}}, settings{})
+	m.pending, m.screen = menuRow{kind: commandRow, id: "command"}, confirmScreen
+	updated, _ := m.updateConfirm(tea.KeyMsg{Type: tea.KeyEnter})
+	if got := updated.(model).data.Commands; len(got) != 0 {
+		t.Fatalf("quick command was not deleted: %#v", got)
+	}
+
+	m = newModel(s, vaultData{
+		CommandGroups: []commandGroup{{ID: "group", Name: "Group"}},
+		Commands:      []quickCommand{{ID: "command", GroupID: "group", Name: "Command", Command: "echo ok", Platform: runtime.GOOS}},
+	}, settings{})
+	m.pending, m.screen = menuRow{kind: commandGroupRow, id: "group"}, confirmScreen
+	updated, _ = m.updateConfirm(tea.KeyMsg{Type: tea.KeyEnter})
+	result := updated.(model)
+	if len(result.data.CommandGroups) != 1 || result.message == "" {
+		t.Fatalf("non-empty command group should not be deleted: %#v", result)
+	}
+}
+
 func TestQuickCommandProcessUsesPowerShellAliasesAndKeepsWindowsShellOpen(t *testing.T) {
 	command := quickCommandProcess("ls")
 	if runtime.GOOS == "windows" {

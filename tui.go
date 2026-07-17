@@ -1734,17 +1734,36 @@ func (m model) updateConfirm(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.message, m.screen = m.tr("delete_group_not_empty"), menuScreen
 			return m, nil
 		}
-		if m.pending.kind == groupRow {
+		if m.pending.kind == commandGroupRow && m.commandGroupHasContent(m.pending.id) {
+			m.message, m.screen = m.tr("delete_command_group_not_empty"), menuScreen
+			return m, nil
+		}
+		switch m.pending.kind {
+		case groupRow:
 			for index, value := range m.data.Groups {
 				if value.ID == m.pending.id {
 					m.data.Groups = append(m.data.Groups[:index], m.data.Groups[index+1:]...)
 					break
 				}
 			}
-		} else {
+		case sessionRow:
 			for index, value := range m.data.Sessions {
 				if value.ID == m.pending.id {
 					m.data.Sessions = append(m.data.Sessions[:index], m.data.Sessions[index+1:]...)
+					break
+				}
+			}
+		case commandGroupRow:
+			for index, value := range m.data.CommandGroups {
+				if value.ID == m.pending.id {
+					m.data.CommandGroups = append(m.data.CommandGroups[:index], m.data.CommandGroups[index+1:]...)
+					break
+				}
+			}
+		case commandRow:
+			for index, value := range m.data.Commands {
+				if value.ID == m.pending.id {
+					m.data.Commands = append(m.data.Commands[:index], m.data.Commands[index+1:]...)
 					break
 				}
 			}
@@ -1766,6 +1785,20 @@ func (m model) groupHasContent(id string) bool {
 		}
 	}
 	for _, value := range m.data.Sessions {
+		if value.GroupID == id {
+			return true
+		}
+	}
+	return false
+}
+
+func (m model) commandGroupHasContent(id string) bool {
+	for _, value := range m.data.CommandGroups {
+		if value.ParentID == id {
+			return true
+		}
+	}
+	for _, value := range m.data.Commands {
 		if value.GroupID == id {
 			return true
 		}
