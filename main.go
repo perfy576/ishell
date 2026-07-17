@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -25,6 +26,8 @@ const (
 	vaultVersion = 1
 	keyringUser  = "vault-key"
 )
+
+var appVersion = "1.0.1"
 
 type vaultFile struct {
 	Version    int    `json:"version"`
@@ -54,6 +57,21 @@ type initScript struct {
 	Content     string `json:"content"`
 }
 
+type commandGroup struct {
+	ID       string `json:"id"`
+	ParentID string `json:"parent_id"`
+	Name     string `json:"name"`
+}
+
+type quickCommand struct {
+	ID        string `json:"id"`
+	GroupID   string `json:"group_id"`
+	Name      string `json:"name"`
+	Command   string `json:"command"`
+	Platform  string `json:"platform"`
+	CreatedAt string `json:"created_at"`
+}
+
 type group struct {
 	ID       string `json:"id"`
 	ParentID string `json:"parent_id"`
@@ -61,13 +79,16 @@ type group struct {
 }
 
 type vaultData struct {
-	Groups   []group      `json:"groups"`
-	Sessions []session    `json:"sessions"`
-	Scripts  []initScript `json:"scripts"`
-	WebDAV   webDAVConfig `json:"webdav"`
+	Groups        []group        `json:"groups"`
+	Sessions      []session      `json:"sessions"`
+	Scripts       []initScript   `json:"scripts"`
+	CommandGroups []commandGroup `json:"command_groups"`
+	Commands      []quickCommand `json:"commands"`
+	WebDAV        webDAVConfig   `json:"webdav"`
 }
 
 type webDAVConfig struct {
+	Enabled  *bool  `json:"enabled,omitempty"`
 	URL      string `json:"url"`
 	Path     string `json:"path"`
 	Username string `json:"username"`
@@ -80,6 +101,17 @@ type settings struct {
 	BackupMax    int    `json:"backup_max"`
 	Language     string `json:"language"`
 	LastBackupAt string `json:"last_backup_at"`
+}
+
+func migrateLegacyCommandPlatforms(data *vaultData) bool {
+	changed := false
+	for index := range data.Commands {
+		if data.Commands[index].Platform == "" {
+			data.Commands[index].Platform = runtime.GOOS
+			changed = true
+		}
+	}
+	return changed
 }
 
 type store struct {
@@ -199,7 +231,17 @@ func (s *store) readSettings() (settings, error) {
 	if err != nil {
 		return value, err
 	}
-	return value, json.Unmarshal(contents, &value)
+	if err := json.Unmarshal(contents, &value); err != nil {
+		return value, err
+	}
+	normalized := normalizeBackupDirectory(value.BackupDir)
+	if normalized != value.BackupDir {
+		value.BackupDir = normalized
+		if err := s.saveSettings(value); err != nil {
+			return value, err
+		}
+	}
+	return value, nil
 }
 
 func (s *store) saveSettings(value settings) error {
@@ -210,25 +252,30 @@ func (s *store) saveSettings(value settings) error {
 	return writePrivateFile(s.settingsPath, contents)
 }
 
-func (s *store) backup(value settings, webdav webDAVConfig) (settings, error) {
-	if strings.TrimSpace(value.BackupDir) == "" {
-		return value, errors.New("set a backup directory first")
-	}
+func (s *store) backup(value settings, webdav webDAVConfig, label string) (settings, error) {
 	contents, err := os.ReadFile(s.vaultPath)
 	if err != nil {
 		return value, err
 	}
-	dir := filepath.Join(value.BackupDir, "ishell-"+time.Now().Format("20060102-150405"))
-	if err := os.MkdirAll(dir, 0700); err != nil {
+	backupDir := normalizeBackupDirectory(value.BackupDir)
+	if backupDir == "" {
+		backupDir = s.dir
+	}
+	if err := os.MkdirAll(backupDir, 0700); err != nil {
 		return value, err
 	}
-	if err := writePrivateFile(filepath.Join(dir, "vault.json"), contents); err != nil {
+	name := webDAVArchiveName(webdav, time.Now(), label)
+	archive, err := archiveVault(contents)
+	if err != nil {
 		return value, err
 	}
-	if err := pruneBackups(value.BackupDir, value.BackupMax); err != nil {
+	if err := writePrivateFile(filepath.Join(backupDir, name), archive); err != nil {
 		return value, err
 	}
-	if err := uploadWebDAVBackup(webdav, filepath.Base(dir), contents, value.BackupMax); err != nil {
+	if err := pruneArchiveBackups(backupDir, value.BackupMax); err != nil {
+		return value, err
+	}
+	if err := uploadWebDAVArchive(webdav, name, archive, value.BackupMax); err != nil {
 		return value, err
 	}
 	value.LastBackupAt = time.Now().UTC().Format(time.RFC3339)
@@ -248,6 +295,16 @@ func (s *store) restore(source string) (vaultData, error) {
 	if err != nil {
 		return vaultData{}, err
 	}
+	if strings.EqualFold(filepath.Ext(path), ".zip") {
+		contents, err = extractVaultArchive(contents)
+		if err != nil {
+			return vaultData{}, err
+		}
+	}
+	return s.restoreVaultContents(contents)
+}
+
+func (s *store) restoreVaultContents(contents []byte) (vaultData, error) {
 	var file vaultFile
 	if err := json.Unmarshal(contents, &file); err != nil {
 		return vaultData{}, fmt.Errorf("read backup vault: %w", err)
@@ -293,6 +350,30 @@ func pruneBackups(root string, maximum int) error {
 	return nil
 }
 
+func pruneArchiveBackups(root string, maximum int) error {
+	if maximum <= 0 {
+		return nil
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return err
+	}
+	var names []string
+	for _, entry := range entries {
+		if !entry.IsDir() && strings.HasSuffix(strings.ToLower(entry.Name()), ".zip") {
+			names = append(names, entry.Name())
+		}
+	}
+	sort.Strings(names)
+	for len(names) > maximum {
+		if err := os.Remove(filepath.Join(root, names[0])); err != nil {
+			return err
+		}
+		names = names[1:]
+	}
+	return nil
+}
+
 func isBackupName(name string) bool {
 	stamp, found := strings.CutPrefix(name, "ishell-")
 	if !found {
@@ -303,14 +384,22 @@ func isBackupName(name string) bool {
 }
 
 func (s *store) backupIfDue(value settings, webdav webDAVConfig) (settings, error) {
-	if value.BackupHours <= 0 || strings.TrimSpace(value.BackupDir) == "" {
+	if value.BackupHours <= 0 {
 		return value, nil
 	}
 	last, err := time.Parse(time.RFC3339, value.LastBackupAt)
 	if err == nil && time.Since(last) < time.Duration(value.BackupHours)*time.Hour {
 		return value, nil
 	}
-	return s.backup(value, webdav)
+	return s.backup(value, webdav, "auto")
+}
+
+func normalizeBackupDirectory(value string) string {
+	return strings.TrimSpace(removeNullCharacters(value))
+}
+
+func removeNullCharacters(value string) string {
+	return strings.ReplaceAll(value, "\x00", "")
 }
 
 func deriveKey(password, salt []byte) []byte {

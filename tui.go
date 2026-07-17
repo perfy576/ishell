@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
 )
@@ -20,8 +22,15 @@ const (
 	menuScreen screen = iota
 	sessionFormScreen
 	groupFormScreen
+	commandFormScreen
+	commandGroupFormScreen
+	commandArgumentsScreen
 	settingsScreen
 	backupSettingsScreen
+	backupLabelScreen
+	webDAVSettingsScreen
+	webDAVBackupsScreen
+	webDAVRestoreConfirmScreen
 	languageSettingsScreen
 	confirmScreen
 	restoreConfirmScreen
@@ -36,6 +45,15 @@ const (
 	sessionRow
 	actionRow
 	scriptRow
+	commandGroupRow
+	commandRow
+)
+
+type rootMode int
+
+const (
+	shellMode rootMode = iota
+	commandMode
 )
 
 type menuRow struct {
@@ -45,23 +63,30 @@ type menuRow struct {
 }
 
 type model struct {
-	store             *store
-	data              vaultData
-	settings          settings
-	screen            screen
-	groupStack        []string
-	cursor            int
-	formField         int
-	formValues        []string
-	message           string
-	pending           menuRow
-	editing           menuRow
-	scriptEditingID   string
-	returnToSession   bool
-	sessionFormValues []string
-	restorePath       string
-	width             int
-	height            int
+	store              *store
+	data               vaultData
+	settings           settings
+	screen             screen
+	groupStack         []string
+	commandGroupStack  []string
+	mode               rootMode
+	cursor             int
+	formField          int
+	formValues         []string
+	manualBackupValues []string
+	message            string
+	pending            menuRow
+	editing            menuRow
+	scriptEditingID    string
+	returnToSession    bool
+	sessionFormValues  []string
+	restorePath        string
+	commandToRun       quickCommand
+	commandParameters  []string
+	cloudBackups       []webDAVArchive
+	pendingCloudBackup webDAVArchive
+	width              int
+	height             int
 }
 
 type backupTickMsg struct{}
@@ -73,6 +98,22 @@ type scriptEditedMsg struct {
 	content string
 	err     error
 }
+type commandEndedMsg struct{ err error }
+type commandPlatformMismatchMsg struct {
+	target  string
+	current string
+}
+type webDAVTestMsg struct{ err error }
+type webDAVBackupsMsg struct {
+	backups []webDAVArchive
+	err     error
+}
+type webDAVRestoreMsg struct {
+	data vaultData
+	err  error
+}
+
+var commandPlaceholderPattern = regexp.MustCompile(`\{\{\s*([^{}]+?)\s*\}\}`)
 
 func newModel(s *store, data vaultData, value settings) model {
 	return model{store: s, data: data, settings: value}
@@ -91,9 +132,19 @@ func (m model) currentGroup() string {
 	return m.groupStack[len(m.groupStack)-1]
 }
 
+func (m model) currentCommandGroup() string {
+	if len(m.commandGroupStack) == 0 {
+		return ""
+	}
+	return m.commandGroupStack[len(m.commandGroupStack)-1]
+}
+
 func (m model) groupPath() string {
+	if m.mode == commandMode {
+		return m.commandGroupPath()
+	}
 	if len(m.groupStack) == 0 {
-		return m.tr("connections")
+		return ""
 	}
 	names := []string{m.tr("connections")}
 	for _, id := range m.groupStack {
@@ -107,7 +158,33 @@ func (m model) groupPath() string {
 	return strings.Join(names, " / ")
 }
 
+func (m model) modeTabs() string {
+	if m.mode == commandMode {
+		return m.tr("shell") + "  [" + m.tr("quick_commands") + "]"
+	}
+	return "[" + m.tr("shell") + "]  " + m.tr("quick_commands")
+}
+
+func (m model) commandGroupPath() string {
+	if len(m.commandGroupStack) == 0 {
+		return ""
+	}
+	names := []string{m.tr("quick_commands")}
+	for _, id := range m.commandGroupStack {
+		for _, value := range m.data.CommandGroups {
+			if value.ID == id {
+				names = append(names, value.Name)
+				break
+			}
+		}
+	}
+	return strings.Join(names, " / ")
+}
+
 func (m model) rows() []menuRow {
+	if m.mode == commandMode {
+		return m.commandRows()
+	}
 	parent := m.currentGroup()
 	var rows []menuRow
 	var groups []group
@@ -144,6 +221,31 @@ func (m model) rows() []menuRow {
 	return rows
 }
 
+func (m model) commandRows() []menuRow {
+	parent := m.currentCommandGroup()
+	var rows []menuRow
+	for _, value := range m.data.CommandGroups {
+		if value.ParentID == parent {
+			rows = append(rows, menuRow{kind: commandGroupRow, label: value.Name + "  >", id: value.ID})
+		}
+	}
+	for _, value := range m.data.Commands {
+		if value.GroupID == parent {
+			prefix := ""
+			if !value.runsOnCurrentPlatform() {
+				prefix = "[x] "
+			}
+			rows = append(rows, menuRow{kind: commandRow, label: prefix + value.Name + "  " + value.Command, id: value.ID})
+		}
+	}
+	rows = append(rows, menuRow{kind: actionRow, label: m.tr("add_command"), id: "add-command"})
+	rows = append(rows, menuRow{kind: actionRow, label: m.tr("add_command_group"), id: "add-command-group"})
+	if parent == "" {
+		rows = append(rows, menuRow{kind: actionRow, label: m.tr("settings"), id: "settings"})
+	}
+	return rows
+}
+
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch value := msg.(type) {
 	case tea.WindowSizeMsg:
@@ -153,7 +255,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		updated, err := m.store.backupIfDue(m.settings, m.data.WebDAV)
 		m.settings = updated
 		if err != nil {
-			m.message = "Automatic backup failed: " + err.Error()
+			m.message = m.tr("automatic_backup_failed") + err.Error()
 		} else if updated.LastBackupAt != "" && updated.LastBackupAt != previous {
 			m.message = "Backup saved."
 		}
@@ -168,6 +270,30 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if value.err != nil {
 			m.message = "Connection ended: " + value.err.Error()
 		}
+	case commandEndedMsg:
+		if value.err != nil {
+			m.message = m.tr("command_ended") + value.err.Error()
+		}
+	case commandPlatformMismatchMsg:
+		m.message = fmt.Sprintf(m.tr("command_platform_mismatch"), platformName(value.target), platformName(value.current))
+	case webDAVTestMsg:
+		if value.err != nil {
+			m.message = m.tr("webdav_test_failed") + value.err.Error()
+		} else {
+			m.message = m.tr("webdav_test_succeeded")
+		}
+	case webDAVBackupsMsg:
+		if value.err != nil {
+			m.message = m.tr("webdav_backup_list_failed") + value.err.Error()
+		} else {
+			m.cloudBackups, m.cursor = value.backups, 0
+		}
+	case webDAVRestoreMsg:
+		if value.err != nil {
+			m.message, m.screen = m.tr("webdav_restore_failed")+value.err.Error(), webDAVBackupsScreen
+		} else {
+			m.data, m.message, m.screen, m.cursor = value.data, m.tr("restored"), menuScreen, 0
+		}
 	case scriptEditedMsg:
 		if value.err != nil {
 			m.message = "Script editor failed: " + value.err.Error()
@@ -178,7 +304,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch m.screen {
 		case menuScreen:
 			return m.updateMenu(value)
-		case sessionFormScreen, groupFormScreen, backupSettingsScreen, languageSettingsScreen:
+		case sessionFormScreen, groupFormScreen, commandFormScreen, commandGroupFormScreen, commandArgumentsScreen, backupSettingsScreen, backupLabelScreen, webDAVSettingsScreen, languageSettingsScreen:
 			return m.updateForm(value)
 		case settingsScreen:
 			return m.updateSettings(value)
@@ -190,6 +316,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateScriptPicker(value)
 		case scriptFormScreen:
 			return m.updateScriptForm(value)
+		case webDAVBackupsScreen:
+			return m.updateWebDAVBackups(value)
+		case webDAVRestoreConfirmScreen:
+			return m.updateWebDAVRestoreConfirm(value)
 		}
 	}
 	return m, nil
@@ -200,6 +330,16 @@ func (m model) updateMenu(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch key.String() {
 	case "ctrl+c":
 		return m, tea.Quit
+	case "left", "right":
+		if len(m.groupStack) != 0 || len(m.commandGroupStack) != 0 {
+			return m, nil
+		}
+		if key.String() == "left" {
+			m.mode = shellMode
+		} else {
+			m.mode = commandMode
+		}
+		m.cursor, m.message = 0, ""
 	case "up", "k":
 		if m.cursor > 0 {
 			m.cursor--
@@ -209,7 +349,7 @@ func (m model) updateMenu(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.cursor++
 		}
 	case "shift+up", "shift+down":
-		if len(rows) == 0 || (rows[m.cursor].kind != groupRow && rows[m.cursor].kind != sessionRow) {
+		if len(rows) == 0 || !isManagedRow(rows[m.cursor].kind) {
 			return m, nil
 		}
 		direction := -1
@@ -223,17 +363,25 @@ func (m model) updateMenu(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.cursor += direction
 		}
 	case "esc", "backspace":
+		if m.mode == commandMode {
+			if len(m.commandGroupStack) == 0 {
+				return m, tea.Quit
+			}
+			m.commandGroupStack = m.commandGroupStack[:len(m.commandGroupStack)-1]
+			m.cursor = 0
+			return m, nil
+		}
 		if len(m.groupStack) == 0 {
 			return m, tea.Quit
 		}
 		m.groupStack = m.groupStack[:len(m.groupStack)-1]
 		m.cursor = 0
 	case "d", "delete":
-		if len(rows) > 0 && (rows[m.cursor].kind == groupRow || rows[m.cursor].kind == sessionRow) {
+		if len(rows) > 0 && isManagedRow(rows[m.cursor].kind) {
 			m.pending, m.screen = rows[m.cursor], confirmScreen
 		}
 	case "e":
-		if len(rows) > 0 && (rows[m.cursor].kind == groupRow || rows[m.cursor].kind == sessionRow) {
+		if len(rows) > 0 && isManagedRow(rows[m.cursor].kind) {
 			m.openEdit(rows[m.cursor])
 		}
 	case "enter":
@@ -247,6 +395,11 @@ func (m model) updateMenu(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.cursor = 0
 		case sessionRow:
 			return m, m.connect(row.id)
+		case commandGroupRow:
+			m.commandGroupStack = append(m.commandGroupStack, row.id)
+			m.cursor = 0
+		case commandRow:
+			return m, m.startCommand(row.id)
 		case actionRow:
 			switch row.id {
 			case "add-session":
@@ -255,12 +408,22 @@ func (m model) updateMenu(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			case "add-group":
 				m.editing = menuRow{}
 				m.screen, m.formField, m.formValues = groupFormScreen, 0, []string{""}
+			case "add-command":
+				m.editing = menuRow{}
+				m.screen, m.formField, m.formValues = commandFormScreen, 0, []string{"", ""}
+			case "add-command-group":
+				m.editing = menuRow{}
+				m.screen, m.formField, m.formValues = commandGroupFormScreen, 0, []string{""}
 			case "settings":
 				m.screen, m.cursor = settingsScreen, 0
 			}
 		}
 	}
 	return m, nil
+}
+
+func isManagedRow(kind rowKind) bool {
+	return kind == groupRow || kind == sessionRow || kind == commandGroupRow || kind == commandRow
 }
 
 func (m model) settingsRows() []menuRow {
@@ -297,7 +460,7 @@ func (m model) updateSettings(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "enter":
 		if rows[m.cursor].id == "backup" {
 			m.screen, m.formField = backupSettingsScreen, 0
-			m.formValues = []string{m.settings.BackupDir, strconv.Itoa(m.settings.BackupHours), strconv.Itoa(m.settings.BackupMax), m.data.WebDAV.URL, m.data.WebDAV.Path, m.data.WebDAV.Username, m.data.WebDAV.Password, ""}
+			m.formValues = m.backupFormValues()
 			return m, m.checkRemoteBackups()
 		}
 		language := m.settings.Language
@@ -311,6 +474,22 @@ func (m model) updateSettings(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 func (m *model) openEdit(row menuRow) {
 	m.editing, m.formField = row, 0
+	if row.kind == commandGroupRow {
+		for _, value := range m.data.CommandGroups {
+			if value.ID == row.id {
+				m.screen, m.formValues = commandGroupFormScreen, []string{value.Name}
+				return
+			}
+		}
+	}
+	if row.kind == commandRow {
+		for _, value := range m.data.Commands {
+			if value.ID == row.id {
+				m.screen, m.formValues = commandFormScreen, []string{value.Name, value.Command}
+				return
+			}
+		}
+	}
 	if row.kind == groupRow {
 		for _, value := range m.data.Groups {
 			if value.ID == row.id {
@@ -371,6 +550,34 @@ func (m *model) moveRow(row menuRow, direction int) (bool, error) {
 			}
 			break
 		}
+	case commandGroupRow:
+		for index, value := range m.data.CommandGroups {
+			if value.ID != row.id {
+				continue
+			}
+			for other := index + direction; other >= 0 && other < len(m.data.CommandGroups); other += direction {
+				if m.data.CommandGroups[other].ParentID == value.ParentID {
+					m.data.CommandGroups[index], m.data.CommandGroups[other] = m.data.CommandGroups[other], m.data.CommandGroups[index]
+					moved = true
+				}
+				break
+			}
+			break
+		}
+	case commandRow:
+		for index, value := range m.data.Commands {
+			if value.ID != row.id {
+				continue
+			}
+			for other := index + direction; other >= 0 && other < len(m.data.Commands); other += direction {
+				if m.data.Commands[other].GroupID == value.GroupID {
+					m.data.Commands[index], m.data.Commands[other] = m.data.Commands[other], m.data.Commands[index]
+					moved = true
+				}
+				break
+			}
+			break
+		}
 	}
 	if !moved {
 		return false, nil
@@ -385,28 +592,37 @@ func (m model) updateForm(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.screen, m.message = settingsScreen, ""
 			return m, nil
 		}
+		if m.screen == backupLabelScreen {
+			m.screen, m.message, m.formField = backupSettingsScreen, "", 0
+			m.formValues, m.manualBackupValues = m.manualBackupValues, nil
+			if len(m.formValues) == 0 {
+				m.formValues = m.backupFormValues()
+			}
+			return m, nil
+		}
+		if m.screen == webDAVSettingsScreen {
+			m.screen, m.message = backupSettingsScreen, ""
+			m.formField = 3
+			m.formValues = m.backupFormValues()
+			return m, nil
+		}
+		if m.screen == commandArgumentsScreen {
+			m.commandToRun, m.commandParameters = quickCommand{}, nil
+		}
 		m.screen, m.message, m.editing = menuScreen, "", menuRow{}
 		return m, nil
 	case "ctrl+b":
 		if m.screen != backupSettingsScreen {
 			return m, nil
 		}
-		if err := m.saveBackupSettings(); err != nil {
-			m.message = "Save failed: " + err.Error()
-			return m, nil
-		}
-		updated, err := m.store.backup(m.settings, m.data.WebDAV)
-		if err != nil {
-			m.message = "Backup failed: " + err.Error()
-		} else {
-			m.settings, m.message = updated, "Backup saved."
-		}
+		m.manualBackupValues = append([]string(nil), m.formValues...)
+		m.screen, m.formField, m.formValues, m.message = backupLabelScreen, 0, []string{""}, ""
 		return m, nil
 	case "ctrl+r":
 		if m.screen != backupSettingsScreen {
 			return m, nil
 		}
-		m.restorePath = strings.TrimSpace(m.formValues[7])
+		m.restorePath = strings.TrimSpace(m.formValues[4])
 		if m.restorePath == "" {
 			m.message = "Enter a backup directory or vault.json path first."
 			return m, nil
@@ -416,10 +632,16 @@ func (m model) updateForm(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "tab", "down":
 		if m.formField < len(m.formValues)-1 {
 			m.formField++
+			if m.screen == webDAVSettingsScreen {
+				m.message = ""
+			}
 		}
 	case "shift+tab", "up":
 		if m.formField > 0 {
 			m.formField--
+			if m.screen == webDAVSettingsScreen {
+				m.message = ""
+			}
 		}
 	case "left", "right":
 		if m.screen == sessionFormScreen && m.formField == 1 {
@@ -437,12 +659,39 @@ func (m model) updateForm(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			default:
 				m.formValues[0] = "auto"
 			}
+		} else if m.screen == webDAVSettingsScreen && m.formField == 0 {
+			if m.formValues[0] == "enabled" {
+				m.formValues[0] = "disabled"
+			} else {
+				m.formValues[0] = "enabled"
+			}
+			m.message = ""
 		}
 	case "enter":
+		if m.screen == backupSettingsScreen && m.formField == 3 {
+			if err := m.saveBackupSettings(); err != nil {
+				m.message = "Save failed: " + err.Error()
+				return m, nil
+			}
+			m.openWebDAVSettings()
+			return m, nil
+		}
 		if m.screen == sessionFormScreen && m.formField == 6 {
 			m.sessionFormValues = append([]string(nil), m.formValues...)
 			m.screen, m.cursor = scriptPickerScreen, 0
 			return m, nil
+		}
+		if m.screen == webDAVSettingsScreen && m.formField == 5 {
+			return m, m.testWebDAV()
+		}
+		if m.screen == webDAVSettingsScreen && m.formField == 6 {
+			config := m.webDAVConfigFromForm()
+			if err := m.saveWebDAVSettings(); err != nil {
+				m.message = "Save failed: " + err.Error()
+				return m, nil
+			}
+			m.screen, m.cursor = webDAVBackupsScreen, 0
+			return m, loadWebDAVBackups(config)
 		}
 		if m.formField < len(m.formValues)-1 {
 			m.formField++
@@ -450,16 +699,22 @@ func (m model) updateForm(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, m.submitForm()
 	case "backspace":
+		if (m.screen == backupSettingsScreen && m.formField == 3) || (m.screen == webDAVSettingsScreen && m.formField >= 5) {
+			return m, nil
+		}
 		value := m.formValues[m.formField]
 		if len(value) > 0 {
-			m.formValues[m.formField] = value[:len(value)-1]
+			m.formValues[m.formField] = deleteLastRune(value)
 		}
 	default:
 		if len(key.Runes) > 0 && key.Type == tea.KeyRunes {
-			if (m.screen == sessionFormScreen && (m.formField == 1 || m.formField == 6)) || (m.screen == languageSettingsScreen && m.formField == 0) {
+			if (m.screen == sessionFormScreen && (m.formField == 1 || m.formField == 6)) || (m.screen == backupSettingsScreen && m.formField == 3) || (m.screen == webDAVSettingsScreen && (m.formField == 0 || m.formField >= 5)) || (m.screen == languageSettingsScreen && m.formField == 0) {
 				return m, nil
 			}
-			m.formValues[m.formField] += string(key.Runes)
+			m.formValues[m.formField] += removeNullCharacters(string(key.Runes))
+			if m.screen == webDAVSettingsScreen {
+				m.message = ""
+			}
 		}
 	}
 	return m, nil
@@ -537,12 +792,118 @@ func (m *model) submitForm() tea.Cmd {
 			return nil
 		}
 		m.message, m.screen, m.cursor, m.editing = m.tr("group_saved"), menuScreen, 0, menuRow{}
+	case commandGroupFormScreen:
+		name := strings.TrimSpace(m.formValues[0])
+		if name == "" {
+			m.message = "A group name is required."
+			return nil
+		}
+		parentID := m.currentCommandGroup()
+		if m.editing.id != "" {
+			for _, value := range m.data.CommandGroups {
+				if value.ID == m.editing.id {
+					parentID = value.ParentID
+					break
+				}
+			}
+		}
+		if m.commandNameInUse(parentID, name, m.editing.id) {
+			m.message = m.tr("name_in_use")
+			return nil
+		}
+		if m.editing.id == "" {
+			m.data.CommandGroups = append(m.data.CommandGroups, commandGroup{ID: newID(), ParentID: parentID, Name: name})
+		} else {
+			for index, value := range m.data.CommandGroups {
+				if value.ID == m.editing.id {
+					m.data.CommandGroups[index].Name = name
+					break
+				}
+			}
+		}
+		if err := m.store.save(m.data); err != nil {
+			m.message = "Save failed: " + err.Error()
+			return nil
+		}
+		m.message, m.screen, m.cursor, m.editing = m.tr("command_group_saved"), menuScreen, 0, menuRow{}
+	case commandFormScreen:
+		name, command := strings.TrimSpace(m.formValues[0]), strings.TrimSpace(m.formValues[1])
+		if name == "" || command == "" {
+			m.message = "Name and command are required."
+			return nil
+		}
+		groupID, platform := m.currentCommandGroup(), runtime.GOOS
+		createdAt := time.Now().UTC().Format(time.RFC3339)
+		if m.editing.id != "" {
+			for _, value := range m.data.Commands {
+				if value.ID == m.editing.id {
+					groupID, platform, createdAt = value.GroupID, value.Platform, value.CreatedAt
+					if platform == "" {
+						platform = runtime.GOOS
+					}
+					break
+				}
+			}
+		}
+		if m.commandNameInUse(groupID, name, m.editing.id) {
+			m.message = m.tr("name_in_use")
+			return nil
+		}
+		updated := quickCommand{ID: newID(), GroupID: groupID, Name: name, Command: command, Platform: platform, CreatedAt: createdAt}
+		if m.editing.id == "" {
+			m.data.Commands = append(m.data.Commands, updated)
+		} else {
+			for index, value := range m.data.Commands {
+				if value.ID == m.editing.id {
+					updated.ID = value.ID
+					m.data.Commands[index] = updated
+					break
+				}
+			}
+		}
+		if err := m.store.save(m.data); err != nil {
+			m.message = "Save failed: " + err.Error()
+			return nil
+		}
+		m.message, m.screen, m.cursor, m.editing = m.tr("command_saved"), menuScreen, 0, menuRow{}
+	case commandArgumentsScreen:
+		commandLine := applyCommandParameters(m.commandToRun.Command, m.commandParameters, m.formValues)
+		m.commandToRun, m.commandParameters = quickCommand{}, nil
+		m.screen, m.cursor, m.formValues = menuScreen, 0, nil
+		return m.executeCommandLine(commandLine)
 	case backupSettingsScreen:
 		if err := m.saveBackupSettings(); err != nil {
 			m.message = "Save failed: " + err.Error()
 			return nil
 		}
 		m.message, m.screen = m.tr("settings_saved"), settingsScreen
+	case backupLabelScreen:
+		label, err := validateBackupLabel(m.formValues[0])
+		if err != nil {
+			m.message = m.tr("backup_label_invalid") + err.Error()
+			return nil
+		}
+		if err := m.saveBackupSettingsValues(m.manualBackupValues); err != nil {
+			m.message = m.tr("save_failed") + err.Error()
+			return nil
+		}
+		updated, err := m.store.backup(m.settings, m.data.WebDAV, label)
+		m.manualBackupValues = nil
+		m.screen, m.formField = backupSettingsScreen, 0
+		if err != nil {
+			m.formValues = m.backupFormValues()
+			m.message = m.tr("backup_failed") + err.Error()
+			return nil
+		}
+		m.settings, m.message = updated, m.tr("backup_saved")
+		m.formValues = m.backupFormValues()
+	case webDAVSettingsScreen:
+		if err := m.saveWebDAVSettings(); err != nil {
+			m.message = "Save failed: " + err.Error()
+			return nil
+		}
+		m.message, m.screen, m.formField = m.tr("settings_saved"), backupSettingsScreen, 3
+		m.formValues = m.backupFormValues()
 	case languageSettingsScreen:
 		language := m.formValues[0]
 		if language != "auto" && language != "zh" && language != "en" {
@@ -560,24 +921,54 @@ func (m *model) submitForm() tea.Cmd {
 }
 
 func (m *model) saveBackupSettings() error {
-	hours, err := strconv.Atoi(strings.TrimSpace(m.formValues[1]))
+	return m.saveBackupSettingsValues(m.formValues)
+}
+
+func (m *model) saveBackupSettingsValues(values []string) error {
+	if len(values) < 3 {
+		return errors.New("backup settings form is incomplete")
+	}
+	hours, err := strconv.Atoi(strings.TrimSpace(removeNullCharacters(values[1])))
 	if err != nil || hours < 0 {
 		return errors.New("backup interval must be a non-negative number of hours")
 	}
-	maximum, err := strconv.Atoi(strings.TrimSpace(m.formValues[2]))
+	maximum, err := strconv.Atoi(strings.TrimSpace(removeNullCharacters(values[2])))
 	if err != nil || maximum < 0 {
 		return errors.New("maximum backup count must be a non-negative number")
 	}
-	backupDir := strings.TrimSpace(m.formValues[0])
+	backupDir := normalizeBackupDirectory(values[0])
 	if backupDir != m.settings.BackupDir {
 		m.settings.LastBackupAt = ""
 	}
 	m.settings.BackupDir, m.settings.BackupHours, m.settings.BackupMax = backupDir, hours, maximum
-	m.data.WebDAV = webDAVConfig{URL: strings.TrimSpace(m.formValues[3]), Path: strings.TrimSpace(m.formValues[4]), Username: strings.TrimSpace(m.formValues[5]), Password: m.formValues[6]}
-	if err := m.store.save(m.data); err != nil {
-		return err
-	}
 	return m.store.saveSettings(m.settings)
+}
+
+func (m model) backupFormValues() []string {
+	webDAVStatus := "disabled"
+	if m.data.WebDAV.enabled() {
+		webDAVStatus = "enabled"
+	}
+	return []string{m.settings.BackupDir, strconv.Itoa(m.settings.BackupHours), strconv.Itoa(m.settings.BackupMax), m.tr(webDAVStatus), ""}
+}
+
+func (m *model) openWebDAVSettings() {
+	enabled := "disabled"
+	if m.data.WebDAV.enabled() {
+		enabled = "enabled"
+	}
+	m.screen, m.formField = webDAVSettingsScreen, 0
+	m.formValues = []string{enabled, m.data.WebDAV.URL, m.data.WebDAV.Path, m.data.WebDAV.Username, m.data.WebDAV.Password, m.tr("webdav_test"), m.tr("cloud_backups"), m.tr("save")}
+}
+
+func (m *model) saveWebDAVSettings() error {
+	m.data.WebDAV = m.webDAVConfigFromForm()
+	return m.store.save(m.data)
+}
+
+func (m model) webDAVConfigFromForm() webDAVConfig {
+	enabled := m.formValues[0] == "enabled"
+	return webDAVConfig{Enabled: &enabled, URL: normalizeWebDAVURL(m.formValues[1]), Path: strings.TrimSpace(m.formValues[2]), Username: strings.TrimSpace(m.formValues[3]), Password: m.formValues[4]}
 }
 
 func (m model) nameInUse(parentID, name, ignoreID string) bool {
@@ -587,6 +978,20 @@ func (m model) nameInUse(parentID, name, ignoreID string) bool {
 		}
 	}
 	for _, value := range m.data.Sessions {
+		if value.GroupID == parentID && value.ID != ignoreID && strings.EqualFold(value.Name, name) {
+			return true
+		}
+	}
+	return false
+}
+
+func (m model) commandNameInUse(parentID, name, ignoreID string) bool {
+	for _, value := range m.data.CommandGroups {
+		if value.ParentID == parentID && value.ID != ignoreID && strings.EqualFold(value.Name, name) {
+			return true
+		}
+	}
+	for _, value := range m.data.Commands {
 		if value.GroupID == parentID && value.ID != ignoreID && strings.EqualFold(value.Name, name) {
 			return true
 		}
@@ -668,6 +1073,102 @@ func (m model) connect(id string) tea.Cmd {
 	return nil
 }
 
+func (m *model) startCommand(id string) tea.Cmd {
+	for _, value := range m.data.Commands {
+		if value.ID != id {
+			continue
+		}
+		if !value.runsOnCurrentPlatform() {
+			return func() tea.Msg {
+				return commandPlatformMismatchMsg{target: value.Platform, current: runtime.GOOS}
+			}
+		}
+		commandLine := strings.TrimSpace(value.Command)
+		if commandLine == "" {
+			return func() tea.Msg { return commandEndedMsg{err: errors.New("command is empty")} }
+		}
+		parameters := commandPlaceholderNames(commandLine)
+		if len(parameters) != 0 {
+			m.commandToRun, m.commandParameters = value, parameters
+			m.screen, m.formField, m.formValues = commandArgumentsScreen, 0, make([]string, len(parameters))
+			return nil
+		}
+		return m.executeCommandLine(commandLine)
+	}
+	return nil
+}
+
+func (c quickCommand) runsOnCurrentPlatform() bool {
+	return c.Platform == runtime.GOOS
+}
+
+func platformName(platform string) string {
+	switch platform {
+	case "darwin":
+		return "macOS"
+	case "linux":
+		return "Linux"
+	case "windows":
+		return "Windows"
+	case "":
+		return "Unknown"
+	default:
+		return platform
+	}
+}
+
+func (m model) executeCommandLine(commandLine string) tea.Cmd {
+	return tea.ExecProcess(quickCommandProcess(commandLine), func(err error) tea.Msg { return commandEndedMsg{err: err} })
+}
+
+func commandPlaceholderNames(commandLine string) []string {
+	matches := commandPlaceholderPattern.FindAllStringSubmatch(commandLine, -1)
+	seen := make(map[string]bool, len(matches))
+	var names []string
+	for _, match := range matches {
+		name := strings.TrimSpace(match[1])
+		if name != "" && !seen[name] {
+			seen[name] = true
+			names = append(names, name)
+		}
+	}
+	return names
+}
+
+func applyCommandParameters(commandLine string, names, values []string) string {
+	parameters := make(map[string]string, len(names))
+	for index, name := range names {
+		if index < len(values) {
+			parameters[name] = values[index]
+		}
+	}
+	return commandPlaceholderPattern.ReplaceAllStringFunc(commandLine, func(match string) string {
+		name := strings.TrimSpace(commandPlaceholderPattern.FindStringSubmatch(match)[1])
+		if value, found := parameters[name]; found {
+			return value
+		}
+		return match
+	})
+}
+
+func quickCommandProcess(commandLine string) *exec.Cmd {
+	if runtime.GOOS == "windows" {
+		// PowerShell supports aliases such as ls. Use cmd for its && and || syntax.
+		if strings.Contains(commandLine, "&&") || strings.Contains(commandLine, "||") {
+			return exec.Command("cmd.exe", "/D", "/S", "/K", commandLine)
+		}
+		if powerShell, err := exec.LookPath("pwsh.exe"); err == nil {
+			return exec.Command(powerShell, "-NoLogo", "-NoExit", "-Command", commandLine)
+		}
+		return exec.Command("powershell.exe", "-NoLogo", "-NoExit", "-Command", commandLine)
+	}
+	shell := os.Getenv("SHELL")
+	if shell == "" {
+		shell = "/bin/sh"
+	}
+	return exec.Command(shell, "-lc", commandLine)
+}
+
 func (m model) initScript(id string) (initScript, bool) {
 	if id == "" {
 		return initScript{}, false
@@ -704,17 +1205,26 @@ func (m model) View() string {
 		if m.screen == restoreConfirmScreen {
 			return m.restoreConfirmView()
 		}
+		if m.screen == webDAVRestoreConfirmScreen {
+			return m.webDAVRestoreConfirmView()
+		}
 		if m.screen == scriptPickerScreen {
 			return m.scriptPickerView()
 		}
 		if m.screen == settingsScreen {
 			return m.settingsView()
 		}
+		if m.screen == webDAVBackupsScreen {
+			return m.webDAVBackupsView()
+		}
 		return m.formView()
 	}
 	var builder strings.Builder
-	builder.WriteString("iShell\n")
-	builder.WriteString(m.groupPath() + "\n\n")
+	builder.WriteString("iShell v" + appVersion + "\n" + m.modeTabs() + "\n")
+	if path := m.groupPath(); path != "" {
+		builder.WriteString("\n" + path + "\n")
+	}
+	builder.WriteString("\n")
 	for index, row := range m.rows() {
 		prefix := "  "
 		if index == m.cursor {
@@ -746,8 +1256,24 @@ func (m model) formView() string {
 		if m.editing.id != "" {
 			title = m.tr("edit_group_title")
 		}
+	case commandFormScreen:
+		title, labels = m.tr("add_command_title"), []string{m.tr("name"), m.tr("command")}
+		if m.editing.id != "" {
+			title = m.tr("edit_command_title")
+		}
+	case commandGroupFormScreen:
+		title, labels = m.tr("add_command_group_title"), []string{m.tr("name")}
+		if m.editing.id != "" {
+			title = m.tr("edit_command_group_title")
+		}
+	case commandArgumentsScreen:
+		title, labels = m.tr("command_parameters")+": "+m.commandToRun.Name, m.commandParameters
 	case backupSettingsScreen:
-		title, labels = m.tr("backup_restore"), []string{m.tr("backup_dir"), m.tr("backup_interval"), m.tr("backup_max"), m.tr("webdav_url"), m.tr("webdav_path"), m.tr("webdav_user"), m.tr("webdav_password"), m.tr("restore_source")}
+		title, labels = m.tr("backup_restore"), []string{m.tr("backup_dir"), m.tr("backup_interval"), m.tr("backup_max"), m.tr("webdav_settings"), m.tr("restore_source")}
+	case backupLabelScreen:
+		title, labels = m.backupLabelFormText()
+	case webDAVSettingsScreen:
+		title, labels = m.tr("webdav_settings"), []string{m.tr("webdav_enabled"), m.tr("webdav_url"), m.tr("webdav_path"), m.tr("webdav_user"), m.tr("webdav_password"), m.tr("webdav_test"), m.tr("cloud_backups"), m.tr("save")}
 	case languageSettingsScreen:
 		title, labels = m.tr("language_settings"), []string{m.tr("language")}
 	case scriptFormScreen:
@@ -779,7 +1305,10 @@ func (m model) formView() string {
 		if m.screen == languageSettingsScreen && index == 0 {
 			value = m.tr(value)
 		}
-		if m.screen == backupSettingsScreen && index == 6 {
+		if m.screen == webDAVSettingsScreen && index == 0 {
+			value = m.tr(value)
+		}
+		if m.screen == webDAVSettingsScreen && index == 4 {
 			value = mask(value)
 		}
 		if m.screen == scriptFormScreen && index == 2 {
@@ -798,6 +1327,10 @@ func (m model) formView() string {
 		builder.WriteString("\n" + m.tr("form_help"))
 	}
 	return builder.String()
+}
+
+func (m model) backupLabelFormText() (string, []string) {
+	return m.tr("backup_label_title"), []string{m.tr("backup_label_field")}
 }
 
 func (m model) scriptName(id string) string {
@@ -920,7 +1453,7 @@ func (m model) updateScriptForm(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.formField < 2 {
 			value := m.formValues[m.formField]
 			if len(value) > 0 {
-				m.formValues[m.formField] = value[:len(value)-1]
+				m.formValues[m.formField] = deleteLastRune(value)
 			}
 		}
 	default:
@@ -929,6 +1462,14 @@ func (m model) updateScriptForm(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 	return m, nil
+}
+
+func deleteLastRune(value string) string {
+	_, size := utf8.DecodeLastRuneInString(value)
+	if size == 0 {
+		return value
+	}
+	return value[:len(value)-size]
 }
 
 func (m *model) submitScriptForm() tea.Cmd {
@@ -1046,6 +1587,9 @@ func (m model) updateRestoreConfirm(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 func (m model) checkRemoteBackups() tea.Cmd {
 	config, localDir, maximum := m.data.WebDAV, m.settings.BackupDir, m.settings.BackupMax
+	if strings.TrimSpace(localDir) == "" && m.store != nil {
+		localDir = m.store.dir
+	}
 	if !config.configured() || strings.TrimSpace(localDir) == "" {
 		return nil
 	}
@@ -1053,6 +1597,88 @@ func (m model) checkRemoteBackups() tea.Cmd {
 		pulled, err := pullNewWebDAVBackups(config, localDir, maximum)
 		return remoteSyncMsg{pulled: pulled, err: err}
 	}
+}
+
+func (m model) testWebDAV() tea.Cmd {
+	config := m.webDAVConfigFromForm()
+	return func() tea.Msg { return webDAVTestMsg{err: testWebDAV(config)} }
+}
+
+func loadWebDAVBackups(config webDAVConfig) tea.Cmd {
+	return func() tea.Msg {
+		backups, err := listWebDAVArchives(config)
+		return webDAVBackupsMsg{backups: backups, err: err}
+	}
+}
+
+func (m model) webDAVBackupsView() string {
+	var builder strings.Builder
+	builder.WriteString(m.tr("cloud_backups") + "\n\n")
+	if len(m.cloudBackups) == 0 {
+		builder.WriteString(m.tr("no_cloud_backups") + "\n")
+	}
+	for index, backup := range m.cloudBackups {
+		prefix := "  "
+		if index == m.cursor {
+			prefix = "> "
+		}
+		builder.WriteString(prefix + backup.Name + "\n")
+	}
+	if m.message != "" {
+		builder.WriteString("\n" + m.message + "\n")
+	}
+	builder.WriteString("\n" + m.tr("cloud_backup_help"))
+	return builder.String()
+}
+
+func (m model) updateWebDAVBackups(key tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch key.String() {
+	case "esc", "backspace", "ctrl+c":
+		m.screen, m.formField = webDAVSettingsScreen, 6
+		m.openWebDAVSettings()
+		m.formField = 6
+	case "up", "k":
+		m.message = ""
+		if m.cursor > 0 {
+			m.cursor--
+		}
+	case "down", "j":
+		m.message = ""
+		if m.cursor < len(m.cloudBackups)-1 {
+			m.cursor++
+		}
+	case "enter":
+		if len(m.cloudBackups) > 0 {
+			m.pendingCloudBackup, m.screen = m.cloudBackups[m.cursor], webDAVRestoreConfirmScreen
+		}
+	}
+	return m, nil
+}
+
+func (m model) webDAVRestoreConfirmView() string {
+	return m.tr("restore_confirm") + "\n" + m.pendingCloudBackup.Name + "\n\n" + m.tr("restore_help")
+}
+
+func (m model) updateWebDAVRestoreConfirm(key tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch key.String() {
+	case "esc", "n":
+		m.screen = webDAVBackupsScreen
+	case "enter", "y":
+		config, name, s := m.data.WebDAV, m.pendingCloudBackup.Name, m.store
+		return m, func() tea.Msg {
+			archive, err := downloadWebDAVArchive(config, name)
+			if err != nil {
+				return webDAVRestoreMsg{err: err}
+			}
+			contents, err := extractVaultArchive(archive)
+			if err != nil {
+				return webDAVRestoreMsg{err: err}
+			}
+			data, err := s.restoreVaultContents(contents)
+			return webDAVRestoreMsg{data: data, err: err}
+		}
+	}
+	return m, nil
 }
 
 func (m model) updateConfirm(key tea.KeyMsg) (tea.Model, tea.Cmd) {
