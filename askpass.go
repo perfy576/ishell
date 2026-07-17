@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -24,11 +25,16 @@ const (
 type askpassServer struct {
 	listener net.Listener
 	token    string
-	password string
+	secrets  sessionSecrets
 	once     sync.Once
 }
 
-func startAskpassServer(password string) (*askpassServer, error) {
+type sessionSecrets struct {
+	Password string `json:"password"`
+	Script   string `json:"script"`
+}
+
+func startAskpassServer(secrets sessionSecrets) (*askpassServer, error) {
 	listener, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
 		return nil, err
@@ -38,7 +44,7 @@ func startAskpassServer(password string) (*askpassServer, error) {
 		listener.Close()
 		return nil, err
 	}
-	server := &askpassServer{listener: listener, token: base64.RawURLEncoding.EncodeToString(random), password: password}
+	server := &askpassServer{listener: listener, token: base64.RawURLEncoding.EncodeToString(random), secrets: secrets}
 	go server.serve()
 	return server, nil
 }
@@ -60,7 +66,7 @@ func (s *askpassServer) handle(connection net.Conn) {
 	if err != nil || subtle.ConstantTimeCompare([]byte(strings.TrimSpace(token)), []byte(s.token)) != 1 {
 		return
 	}
-	fmt.Fprint(connection, s.password)
+	_ = json.NewEncoder(connection).Encode(s.secrets)
 }
 
 func (s *askpassServer) Close() {
@@ -72,7 +78,8 @@ func runAskpass() {
 	if len(os.Args) < 2 || !strings.Contains(strings.ToLower(os.Args[1]), "password") {
 		os.Exit(1)
 	}
-	password, err := readSessionSecret()
+	secrets, err := readSessionSecrets()
+	password := secrets.Password
 	if err != nil || password == "" {
 		os.Exit(1)
 	}
@@ -80,25 +87,35 @@ func runAskpass() {
 }
 
 func readSessionSecret() (string, error) {
+	secrets, err := readSessionSecrets()
+	return secrets.Password, err
+}
+
+func readSessionSecrets() (sessionSecrets, error) {
 	connection, err := net.DialTimeout("tcp", os.Getenv(askpassAddressEnv), 5*time.Second)
 	if err != nil {
-		return "", err
+		return sessionSecrets{}, err
 	}
 	defer connection.Close()
 	connection.SetDeadline(time.Now().Add(10 * time.Second))
 	if _, err := fmt.Fprintln(connection, os.Getenv(askpassTokenEnv)); err != nil {
-		return "", err
+		return sessionSecrets{}, err
 	}
-	password, err := io.ReadAll(io.LimitReader(connection, 4096))
+	contents, err := io.ReadAll(io.LimitReader(connection, 1<<20))
 	if err != nil {
-		return "", err
+		return sessionSecrets{}, err
 	}
-	return string(password), nil
+	var secrets sessionSecrets
+	if err := json.Unmarshal(contents, &secrets); err != nil {
+		return sessionSecrets{}, err
+	}
+	return secrets, nil
 }
 
 type telnetLoginState struct {
 	user     string
 	password string
+	script   string
 	stage    int
 	tail     string
 }
@@ -114,7 +131,11 @@ func (s *telnetLoginState) observe(value string) []string {
 	}
 	if s.stage < 2 && strings.Contains(s.tail, "password:") && s.password != "" {
 		s.stage = 2
-		return []string{s.password + "\r\n"}
+		responses := []string{s.password + "\r\n"}
+		if s.script != "" {
+			responses = append(responses, strings.ReplaceAll(s.script, "\n", "\r\n")+"\r\n")
+		}
+		return responses
 	}
 	return nil
 }
@@ -124,10 +145,10 @@ func runTelnet(args []string) {
 		fmt.Fprintln(os.Stderr, "ishell: telnet requires host, port, and user")
 		os.Exit(1)
 	}
-	password := ""
+	secrets := sessionSecrets{}
 	if os.Getenv(askpassAddressEnv) != "" {
 		var err error
-		password, err = readSessionSecret()
+		secrets, err = readSessionSecrets()
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "ishell: read Telnet password:", err)
 			os.Exit(1)
@@ -152,7 +173,7 @@ func runTelnet(args []string) {
 	}
 	go func() { _, _ = io.Copy(connection, os.Stdin) }()
 
-	login := telnetLoginState{user: args[2], password: password}
+	login := telnetLoginState{user: args[2], password: secrets.Password, script: secrets.Script}
 	readTelnet(connection, &login)
 }
 

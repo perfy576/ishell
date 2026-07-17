@@ -60,7 +60,7 @@ func main() {
 	if err != nil {
 		fatal(err)
 	}
-	if value, err = s.backupIfDue(value); err != nil {
+	if value, err = s.backupIfDue(value, data.WebDAV); err != nil {
 		fmt.Fprintln(os.Stderr, "backup skipped:", err)
 	}
 	if _, err := tea.NewProgram(newModel(s, data, value), tea.WithAltScreen()).Run(); err != nil {

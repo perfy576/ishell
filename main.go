@@ -35,15 +35,23 @@ type vaultFile struct {
 }
 
 type session struct {
-	ID       string `json:"id"`
-	GroupID  string `json:"group_id"`
-	Name     string `json:"name"`
-	Protocol string `json:"protocol"`
-	Host     string `json:"host"`
-	User     string `json:"user"`
-	Port     string `json:"port"`
-	Password string `json:"password"`
-	Created  string `json:"created"`
+	ID           string `json:"id"`
+	GroupID      string `json:"group_id"`
+	Name         string `json:"name"`
+	Protocol     string `json:"protocol"`
+	Host         string `json:"host"`
+	User         string `json:"user"`
+	Port         string `json:"port"`
+	Password     string `json:"password"`
+	InitScriptID string `json:"init_script_id"`
+	Created      string `json:"created"`
+}
+
+type initScript struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Interpreter string `json:"interpreter"`
+	Content     string `json:"content"`
 }
 
 type group struct {
@@ -53,8 +61,17 @@ type group struct {
 }
 
 type vaultData struct {
-	Groups   []group   `json:"groups"`
-	Sessions []session `json:"sessions"`
+	Groups   []group      `json:"groups"`
+	Sessions []session    `json:"sessions"`
+	Scripts  []initScript `json:"scripts"`
+	WebDAV   webDAVConfig `json:"webdav"`
+}
+
+type webDAVConfig struct {
+	URL      string `json:"url"`
+	Path     string `json:"path"`
+	Username string `json:"username"`
+	Password string `json:"password"`
 }
 
 type settings struct {
@@ -193,7 +210,7 @@ func (s *store) saveSettings(value settings) error {
 	return writePrivateFile(s.settingsPath, contents)
 }
 
-func (s *store) backup(value settings) (settings, error) {
+func (s *store) backup(value settings, webdav webDAVConfig) (settings, error) {
 	if strings.TrimSpace(value.BackupDir) == "" {
 		return value, errors.New("set a backup directory first")
 	}
@@ -211,8 +228,45 @@ func (s *store) backup(value settings) (settings, error) {
 	if err := pruneBackups(value.BackupDir, value.BackupMax); err != nil {
 		return value, err
 	}
+	if err := uploadWebDAVBackup(webdav, filepath.Base(dir), contents, value.BackupMax); err != nil {
+		return value, err
+	}
 	value.LastBackupAt = time.Now().UTC().Format(time.RFC3339)
 	return value, s.saveSettings(value)
+}
+
+func (s *store) restore(source string) (vaultData, error) {
+	path := strings.TrimSpace(source)
+	info, err := os.Stat(path)
+	if err != nil {
+		return vaultData{}, err
+	}
+	if info.IsDir() {
+		path = filepath.Join(path, "vault.json")
+	}
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		return vaultData{}, err
+	}
+	var file vaultFile
+	if err := json.Unmarshal(contents, &file); err != nil {
+		return vaultData{}, fmt.Errorf("read backup vault: %w", err)
+	}
+	if file.Version != vaultVersion || file.Password != s.password {
+		return vaultData{}, errors.New("backup vault is incompatible with the current vault")
+	}
+	plaintext, err := decrypt(s.key, file)
+	if err != nil {
+		return vaultData{}, errors.New("backup cannot be unlocked with the current vault key")
+	}
+	var data vaultData
+	if err := json.Unmarshal(plaintext, &data); err != nil {
+		return vaultData{}, fmt.Errorf("decode backup vault: %w", err)
+	}
+	if err := writePrivateFile(s.vaultPath, contents); err != nil {
+		return vaultData{}, err
+	}
+	return data, nil
 }
 
 func pruneBackups(root string, maximum int) error {
@@ -248,7 +302,7 @@ func isBackupName(name string) bool {
 	return err == nil
 }
 
-func (s *store) backupIfDue(value settings) (settings, error) {
+func (s *store) backupIfDue(value settings, webdav webDAVConfig) (settings, error) {
 	if value.BackupHours <= 0 || strings.TrimSpace(value.BackupDir) == "" {
 		return value, nil
 	}
@@ -256,7 +310,7 @@ func (s *store) backupIfDue(value settings) (settings, error) {
 	if err == nil && time.Since(last) < time.Duration(value.BackupHours)*time.Hour {
 		return value, nil
 	}
-	return s.backup(value)
+	return s.backup(value, webdav)
 }
 
 func deriveKey(password, salt []byte) []byte {
