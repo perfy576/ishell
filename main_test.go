@@ -379,6 +379,17 @@ func TestNumericShortcutsActivateShellAndCommandGroups(t *testing.T) {
 	}
 }
 
+func TestDetachedCommandLaunchQuitsIShell(t *testing.T) {
+	m := newModel(nil, vaultData{}, settings{})
+	_, command := m.Update(commandLaunchedMsg{})
+	if command == nil {
+		t.Fatal("successful detached command launch should quit iShell")
+	}
+	if _, ok := command().(tea.QuitMsg); !ok {
+		t.Fatalf("launch result = %#v, want QuitMsg", command())
+	}
+}
+
 func TestDeleteQuickCommandAndProtectNonEmptyCommandGroup(t *testing.T) {
 	dir := t.TempDir()
 	s := &store{dir: dir, vaultPath: filepath.Join(dir, "vault.json"), key: bytes.Repeat([]byte{1}, 32), salt: bytes.Repeat([]byte{2}, 16), password: true}

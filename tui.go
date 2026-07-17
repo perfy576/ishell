@@ -99,6 +99,7 @@ type scriptEditedMsg struct {
 	err     error
 }
 type commandEndedMsg struct{ err error }
+type commandLaunchedMsg struct{ err error }
 type commandPlatformMismatchMsg struct {
 	target  string
 	current string
@@ -311,6 +312,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if value.err != nil {
 			m.message = m.tr("command_ended") + value.err.Error()
 		}
+	case commandLaunchedMsg:
+		if value.err != nil {
+			m.message = m.tr("command_ended") + value.err.Error()
+			break
+		}
+		return m, tea.Quit
 	case commandPlatformMismatchMsg:
 		m.message = fmt.Sprintf(m.tr("command_platform_mismatch"), platformName(value.target), platformName(value.current))
 	case webDAVTestMsg:
@@ -1162,7 +1169,7 @@ func platformName(platform string) string {
 }
 
 func (m model) executeCommandLine(commandLine string) tea.Cmd {
-	return tea.ExecProcess(quickCommandProcess(commandLine), func(err error) tea.Msg { return commandEndedMsg{err: err} })
+	return func() tea.Msg { return commandLaunchedMsg{err: launchDetachedQuickCommand(commandLine)} }
 }
 
 func commandPlaceholderNames(commandLine string) []string {
