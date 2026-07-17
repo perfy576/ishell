@@ -344,7 +344,7 @@ func TestQuickCommandProcessUsesPowerShellAliasesAndKeepsWindowsShellOpen(t *tes
 		}
 		return
 	}
-	if len(command.Args) != 3 || command.Args[1] != "-lc" || command.Args[2] != "dir" {
+	if len(command.Args) != 3 || command.Args[1] != "-lc" || command.Args[2] != "ls" {
 		t.Fatalf("unexpected Unix command args: %#v", command.Args)
 	}
 }
