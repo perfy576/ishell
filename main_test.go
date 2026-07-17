@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -319,7 +320,7 @@ func TestCrossPlatformCommandIsMarkedAndCannotRun(t *testing.T) {
 	}
 	m := newModel(nil, vaultData{Commands: []quickCommand{{ID: "foreign", Name: "Foreign", Command: "echo no", Platform: target}}}, settings{})
 	m.mode = commandMode
-	if got := m.rows()[0].label; !strings.HasPrefix(got, "[x] ") {
+	if got := m.rows()[0].label; !strings.Contains(got, "[x] ") {
 		t.Fatalf("cross-platform command label = %q", got)
 	}
 	cmd := m.startCommand("foreign")
@@ -329,6 +330,52 @@ func TestCrossPlatformCommandIsMarkedAndCannotRun(t *testing.T) {
 	message, ok := cmd().(commandPlatformMismatchMsg)
 	if !ok || message.target != target || message.current != runtime.GOOS {
 		t.Fatalf("unexpected command message: %#v", message)
+	}
+}
+
+func TestNumberedRowsStartAtOneAndSkipActions(t *testing.T) {
+	m := newModel(nil, vaultData{
+		Groups:   []group{{ID: "group", Name: "Group"}},
+		Sessions: []session{{ID: "session", Name: "Session"}},
+	}, settings{})
+	rows := m.rows()
+	if !strings.HasPrefix(rows[0].label, "[1] ") || !strings.HasPrefix(rows[1].label, "[2] ") || strings.HasPrefix(rows[2].label, "[") {
+		t.Fatalf("unexpected numbered rows: %#v", rows)
+	}
+}
+
+func TestNumericShortcutsActivateShellAndCommandGroups(t *testing.T) {
+	m := newModel(nil, vaultData{
+		Groups:   []group{{ID: "group", Name: "Group"}},
+		Sessions: []session{{ID: "session", Name: "Session", Host: "example.test"}},
+	}, settings{})
+	updated, _ := m.updateMenu(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'1'}})
+	if got := updated.(model).groupStack; !slices.Equal(got, []string{"group"}) {
+		t.Fatalf("shortcut 1 group stack = %#v", got)
+	}
+	if _, command := m.updateMenu(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'2'}}); command == nil {
+		t.Fatal("shortcut 2 should trigger the session")
+	}
+
+	m = newModel(nil, vaultData{
+		CommandGroups: []commandGroup{{ID: "group", Name: "Group"}},
+		Commands:      []quickCommand{{ID: "command", Name: "Command", Command: "echo ok", Platform: runtime.GOOS}},
+	}, settings{})
+	m.mode = commandMode
+	updated, _ = m.updateMenu(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'1'}})
+	if got := updated.(model).commandGroupStack; !slices.Equal(got, []string{"group"}) {
+		t.Fatalf("shortcut 1 command group stack = %#v", got)
+	}
+	if _, command := m.updateMenu(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'2'}}); command == nil {
+		t.Fatal("shortcut 2 should trigger the quick command")
+	}
+
+	rows := make([]menuRow, 10)
+	for index := range rows {
+		rows[index] = menuRow{kind: sessionRow, id: strconv.Itoa(index + 1)}
+	}
+	if row, found := numberedRow(rows, "0"); !found || row.id != "10" {
+		t.Fatalf("shortcut 0 should select item 10: %#v, %t", row, found)
 	}
 }
 

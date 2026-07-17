@@ -218,7 +218,7 @@ func (m model) rows() []menuRow {
 	if parent == "" {
 		rows = append(rows, menuRow{kind: actionRow, label: m.tr("settings"), id: "settings"})
 	}
-	return rows
+	return numberManagedRows(rows)
 }
 
 func (m model) commandRows() []menuRow {
@@ -243,7 +243,44 @@ func (m model) commandRows() []menuRow {
 	if parent == "" {
 		rows = append(rows, menuRow{kind: actionRow, label: m.tr("settings"), id: "settings"})
 	}
+	return numberManagedRows(rows)
+}
+
+func numberManagedRows(rows []menuRow) []menuRow {
+	number := 1
+	for index := range rows {
+		if !isManagedRow(rows[index].kind) {
+			continue
+		}
+		if number <= 10 {
+			rows[index].label = fmt.Sprintf("[%d] %s", number, rows[index].label)
+		}
+		number++
+	}
 	return rows
+}
+
+func numberedRow(rows []menuRow, key string) (menuRow, bool) {
+	var wanted int
+	switch key {
+	case "1", "2", "3", "4", "5", "6", "7", "8", "9":
+		wanted = int(key[0] - '0')
+	case "0":
+		wanted = 10
+	default:
+		return menuRow{}, false
+	}
+	number := 0
+	for _, row := range rows {
+		if !isManagedRow(row.kind) {
+			continue
+		}
+		number++
+		if number == wanted {
+			return row, true
+		}
+	}
+	return menuRow{}, false
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -327,6 +364,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m model) updateMenu(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	rows := m.rows()
+	if row, found := numberedRow(rows, key.String()); found {
+		return m.activateMenuRow(row)
+	}
 	switch key.String() {
 	case "ctrl+c":
 		return m, tea.Quit
@@ -388,35 +428,39 @@ func (m model) updateMenu(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if len(rows) == 0 {
 			return m, nil
 		}
-		row := rows[m.cursor]
-		switch row.kind {
-		case groupRow:
-			m.groupStack = append(m.groupStack, row.id)
-			m.cursor = 0
-		case sessionRow:
-			return m, m.connect(row.id)
-		case commandGroupRow:
-			m.commandGroupStack = append(m.commandGroupStack, row.id)
-			m.cursor = 0
-		case commandRow:
-			return m, m.startCommand(row.id)
-		case actionRow:
-			switch row.id {
-			case "add-session":
-				m.editing = menuRow{}
-				m.screen, m.formField, m.formValues = sessionFormScreen, 0, []string{"", "ssh", "", "", "22", "", ""}
-			case "add-group":
-				m.editing = menuRow{}
-				m.screen, m.formField, m.formValues = groupFormScreen, 0, []string{""}
-			case "add-command":
-				m.editing = menuRow{}
-				m.screen, m.formField, m.formValues = commandFormScreen, 0, []string{"", ""}
-			case "add-command-group":
-				m.editing = menuRow{}
-				m.screen, m.formField, m.formValues = commandGroupFormScreen, 0, []string{""}
-			case "settings":
-				m.screen, m.cursor = settingsScreen, 0
-			}
+		return m.activateMenuRow(rows[m.cursor])
+	}
+	return m, nil
+}
+
+func (m model) activateMenuRow(row menuRow) (tea.Model, tea.Cmd) {
+	switch row.kind {
+	case groupRow:
+		m.groupStack = append(m.groupStack, row.id)
+		m.cursor = 0
+	case sessionRow:
+		return m, m.connect(row.id)
+	case commandGroupRow:
+		m.commandGroupStack = append(m.commandGroupStack, row.id)
+		m.cursor = 0
+	case commandRow:
+		return m, m.startCommand(row.id)
+	case actionRow:
+		switch row.id {
+		case "add-session":
+			m.editing = menuRow{}
+			m.screen, m.formField, m.formValues = sessionFormScreen, 0, []string{"", "ssh", "", "", "22", "", ""}
+		case "add-group":
+			m.editing = menuRow{}
+			m.screen, m.formField, m.formValues = groupFormScreen, 0, []string{""}
+		case "add-command":
+			m.editing = menuRow{}
+			m.screen, m.formField, m.formValues = commandFormScreen, 0, []string{"", ""}
+		case "add-command-group":
+			m.editing = menuRow{}
+			m.screen, m.formField, m.formValues = commandGroupFormScreen, 0, []string{""}
+		case "settings":
+			m.screen, m.cursor = settingsScreen, 0
 		}
 	}
 	return m, nil
