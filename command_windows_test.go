@@ -31,3 +31,15 @@ func TestDetachedQuickCommandScriptsUseTheRightShell(t *testing.T) {
 		t.Fatalf("PowerShell script = %q %#v %q %v", executable, arguments, contents, err)
 	}
 }
+
+func TestDetachedQuickCommandPreservesCmdArguments(t *testing.T) {
+	command := detachedQuickCommand("cmd.exe", "/D", "/K", `C:\Users\test user\command.cmd`)
+	want := []string{"cmd.exe", "/D", "/K", `C:\Users\test user\command.cmd`}
+	if !slices.Equal(command.Args, want) {
+		t.Fatalf("command args = %#v, want %#v", command.Args, want)
+	}
+	attributes := command.SysProcAttr
+	if attributes == nil || attributes.CreationFlags != createNewConsole {
+		t.Fatalf("process attributes = %#v", command.SysProcAttr)
+	}
+}

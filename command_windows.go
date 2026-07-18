@@ -5,25 +5,30 @@ package main
 import (
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
+	"syscall"
 )
+
+const createNewConsole = 0x00000010
 
 func launchDetachedQuickCommand(commandLine string) error {
 	executable, arguments, scriptPath, err := detachedQuickCommandScript(commandLine)
 	if err != nil {
 		return err
 	}
-	commandLine = "start \"\" " + quoteCmdArgument(executable)
-	for _, argument := range arguments {
-		commandLine += " " + quoteCmdArgument(argument)
-	}
-	command := exec.Command("cmd.exe", "/D", "/S", "/C", commandLine)
+	command := detachedQuickCommand(executable, arguments...)
 	if err := command.Start(); err != nil {
 		_ = os.Remove(scriptPath)
 		return err
 	}
 	return nil
+}
+
+func detachedQuickCommand(executable string, arguments ...string) *exec.Cmd {
+	command := exec.Command(executable, arguments...)
+	// A new console avoids inheriting iShell's hidden terminal handles.
+	command.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNewConsole}
+	return command
 }
 
 func detachedQuickCommandScript(commandLine string) (string, []string, string, error) {
@@ -61,8 +66,4 @@ func writeDetachedCommandScript(extension, contents string) (string, error) {
 		return "", err
 	}
 	return path, nil
-}
-
-func quoteCmdArgument(value string) string {
-	return "\"" + strings.ReplaceAll(filepath.Clean(value), "\"", "\"\"") + "\""
 }

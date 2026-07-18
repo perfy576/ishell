@@ -25,7 +25,7 @@ const (
 	keyringUser  = "vault-key"
 )
 
-var appVersion = "1.0.2"
+var appVersion = "1.0.3"
 
 type vaultFile struct {
 	Version    int    `json:"version"`
