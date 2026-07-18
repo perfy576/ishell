@@ -31,9 +31,12 @@ const (
 	webDAVSettingsScreen
 	webDAVBackupsScreen
 	webDAVRestoreConfirmScreen
+	webDAVDeleteConfirmScreen
 	languageSettingsScreen
+	changeVaultPasswordScreen
 	confirmScreen
 	restoreConfirmScreen
+	restorePasswordScreen
 	scriptPickerScreen
 	scriptFormScreen
 )
@@ -63,30 +66,34 @@ type menuRow struct {
 }
 
 type model struct {
-	store              *store
-	data               vaultData
-	settings           settings
-	screen             screen
-	groupStack         []string
-	commandGroupStack  []string
-	mode               rootMode
-	cursor             int
-	formField          int
-	formValues         []string
-	manualBackupValues []string
-	message            string
-	pending            menuRow
-	editing            menuRow
-	scriptEditingID    string
-	returnToSession    bool
-	sessionFormValues  []string
-	restorePath        string
-	commandToRun       quickCommand
-	commandParameters  []string
-	cloudBackups       []webDAVArchive
-	pendingCloudBackup webDAVArchive
-	width              int
-	height             int
+	store                 *store
+	data                  vaultData
+	settings              settings
+	screen                screen
+	groupStack            []string
+	commandGroupStack     []string
+	mode                  rootMode
+	cursor                int
+	formField             int
+	formValues            []string
+	manualBackupValues    []string
+	message               string
+	pending               menuRow
+	editing               menuRow
+	scriptEditingID       string
+	returnToSession       bool
+	sessionFormValues     []string
+	restorePath           string
+	commandToRun          quickCommand
+	commandParameters     []string
+	cloudBackups          []webDAVArchive
+	pendingCloudBackup    webDAVArchive
+	restoreContents       []byte
+	restoreFromWebDAV     bool
+	restoreLegacyNoPass   bool
+	restoreLegacyPassword bool
+	width                 int
+	height                int
 }
 
 type backupTickMsg struct{}
@@ -110,7 +117,11 @@ type webDAVBackupsMsg struct {
 	err     error
 }
 type webDAVRestoreMsg struct {
-	data vaultData
+	contents []byte
+	err      error
+}
+type webDAVDeleteMsg struct {
+	name string
 	err  error
 }
 
@@ -290,7 +301,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width, m.height = value.Width, value.Height
 	case backupTickMsg:
 		previous := m.settings.LastBackupAt
-		updated, err := m.store.backupIfDue(m.settings, m.data.WebDAV)
+		updated, err := m.store.backupIfDue(m.settings, m.data.WebDAV, m.data.BackupPassword)
 		m.settings = updated
 		if err != nil {
 			m.message = m.tr("automatic_backup_failed") + err.Error()
@@ -335,9 +346,29 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case webDAVRestoreMsg:
 		if value.err != nil {
 			m.message, m.screen = m.tr("webdav_restore_failed")+value.err.Error(), webDAVBackupsScreen
+		} else if file, _, err := parseVaultFile(value.contents); err != nil {
+			m.message, m.screen = m.tr("webdav_restore_failed")+err.Error(), webDAVBackupsScreen
 		} else {
-			m.data, m.message, m.screen, m.cursor = value.data, m.tr("restored"), menuScreen, 0
+			m.restoreContents, m.restoreFromWebDAV = value.contents, true
+			m.restoreLegacyNoPass = !file.Backup && !file.Password
+			m.restoreLegacyPassword = !file.Backup && file.Password
+			m.screen, m.formField, m.formValues, m.message = restorePasswordScreen, 0, []string{""}, ""
 		}
+	case webDAVDeleteMsg:
+		if value.err != nil {
+			m.message = "Delete failed: " + value.err.Error()
+			break
+		}
+		for index, backup := range m.cloudBackups {
+			if backup.Name == value.name {
+				m.cloudBackups = append(m.cloudBackups[:index], m.cloudBackups[index+1:]...)
+				break
+			}
+		}
+		if m.cursor >= len(m.cloudBackups) && m.cursor > 0 {
+			m.cursor--
+		}
+		m.message = "Backup deleted."
 	case scriptEditedMsg:
 		if value.err != nil {
 			m.message = "Script editor failed: " + value.err.Error()
@@ -348,7 +379,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch m.screen {
 		case menuScreen:
 			return m.updateMenu(value)
-		case sessionFormScreen, groupFormScreen, commandFormScreen, commandGroupFormScreen, commandArgumentsScreen, backupSettingsScreen, backupLabelScreen, webDAVSettingsScreen, languageSettingsScreen:
+		case sessionFormScreen, groupFormScreen, commandFormScreen, commandGroupFormScreen, commandArgumentsScreen, backupSettingsScreen, backupLabelScreen, webDAVSettingsScreen, languageSettingsScreen, changeVaultPasswordScreen, restorePasswordScreen:
 			return m.updateForm(value)
 		case settingsScreen:
 			return m.updateSettings(value)
@@ -364,6 +395,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateWebDAVBackups(value)
 		case webDAVRestoreConfirmScreen:
 			return m.updateWebDAVRestoreConfirm(value)
+		case webDAVDeleteConfirmScreen:
+			return m.updateWebDAVDeleteConfirm(value)
 		}
 	}
 	return m, nil
@@ -478,7 +511,7 @@ func isManagedRow(kind rowKind) bool {
 }
 
 func (m model) settingsRows() []menuRow {
-	return []menuRow{{kind: actionRow, label: m.tr("backup_restore"), id: "backup"}, {kind: actionRow, label: m.tr("language_settings"), id: "language"}}
+	return []menuRow{{kind: actionRow, label: m.tr("backup_restore"), id: "backup"}, {kind: actionRow, label: m.tr("change_vault_password"), id: "change-vault-password"}, {kind: actionRow, label: m.tr("language_settings"), id: "language"}}
 }
 
 func (m model) settingsView() string {
@@ -513,6 +546,10 @@ func (m model) updateSettings(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.screen, m.formField = backupSettingsScreen, 0
 			m.formValues = m.backupFormValues()
 			return m, m.checkRemoteBackups()
+		}
+		if rows[m.cursor].id == "change-vault-password" {
+			m.screen, m.formField, m.formValues = changeVaultPasswordScreen, 0, []string{"", "", ""}
+			return m, nil
 		}
 		language := m.settings.Language
 		if language == "" {
@@ -639,7 +676,19 @@ func (m *model) moveRow(row menuRow, direction int) (bool, error) {
 func (m model) updateForm(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch key.String() {
 	case "ctrl+c", "esc":
-		if m.screen == backupSettingsScreen || m.screen == languageSettingsScreen {
+		if m.screen == restorePasswordScreen {
+			m.formValues, m.restoreContents = nil, nil
+			m.restoreLegacyNoPass, m.restoreLegacyPassword = false, false
+			if m.restoreFromWebDAV {
+				m.screen = webDAVBackupsScreen
+			} else {
+				m.screen = backupSettingsScreen
+				m.formValues = m.backupFormValues()
+			}
+			m.restoreFromWebDAV, m.message = false, ""
+			return m, nil
+		}
+		if m.screen == backupSettingsScreen || m.screen == languageSettingsScreen || m.screen == changeVaultPasswordScreen {
 			m.screen, m.message = settingsScreen, ""
 			return m, nil
 		}
@@ -653,7 +702,7 @@ func (m model) updateForm(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		if m.screen == webDAVSettingsScreen {
 			m.screen, m.message = backupSettingsScreen, ""
-			m.formField = 3
+			m.formField = 4
 			m.formValues = m.backupFormValues()
 			return m, nil
 		}
@@ -673,7 +722,7 @@ func (m model) updateForm(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.screen != backupSettingsScreen {
 			return m, nil
 		}
-		m.restorePath = strings.TrimSpace(m.formValues[4])
+		m.restorePath = strings.TrimSpace(m.formValues[5])
 		if m.restorePath == "" {
 			m.message = "Enter a backup directory or vault.json path first."
 			return m, nil
@@ -719,7 +768,7 @@ func (m model) updateForm(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.message = ""
 		}
 	case "enter":
-		if m.screen == backupSettingsScreen && m.formField == 3 {
+		if m.screen == backupSettingsScreen && m.formField == 4 {
 			if err := m.saveBackupSettings(); err != nil {
 				m.message = "Save failed: " + err.Error()
 				return m, nil
@@ -750,7 +799,7 @@ func (m model) updateForm(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, m.submitForm()
 	case "backspace":
-		if (m.screen == backupSettingsScreen && m.formField == 3) || (m.screen == webDAVSettingsScreen && m.formField >= 5) {
+		if (m.screen == backupSettingsScreen && m.formField == 4) || (m.screen == webDAVSettingsScreen && m.formField >= 5) {
 			return m, nil
 		}
 		value := m.formValues[m.formField]
@@ -759,7 +808,7 @@ func (m model) updateForm(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	default:
 		if len(key.Runes) > 0 && key.Type == tea.KeyRunes {
-			if (m.screen == sessionFormScreen && (m.formField == 1 || m.formField == 6)) || (m.screen == backupSettingsScreen && m.formField == 3) || (m.screen == webDAVSettingsScreen && (m.formField == 0 || m.formField >= 5)) || (m.screen == languageSettingsScreen && m.formField == 0) {
+			if (m.screen == sessionFormScreen && (m.formField == 1 || m.formField == 6)) || (m.screen == backupSettingsScreen && m.formField == 4) || (m.screen == webDAVSettingsScreen && (m.formField == 0 || m.formField >= 5)) || (m.screen == languageSettingsScreen && m.formField == 0) {
 				return m, nil
 			}
 			m.formValues[m.formField] += removeNullCharacters(string(key.Runes))
@@ -938,7 +987,7 @@ func (m *model) submitForm() tea.Cmd {
 			m.message = m.tr("save_failed") + err.Error()
 			return nil
 		}
-		updated, err := m.store.backup(m.settings, m.data.WebDAV, label)
+		updated, err := m.store.backup(m.settings, m.data.WebDAV, m.data.BackupPassword, label)
 		m.manualBackupValues = nil
 		m.screen, m.formField = backupSettingsScreen, 0
 		if err != nil {
@@ -948,12 +997,41 @@ func (m *model) submitForm() tea.Cmd {
 		}
 		m.settings, m.message = updated, m.tr("backup_saved")
 		m.formValues = m.backupFormValues()
+	case changeVaultPasswordScreen:
+		if m.formValues[1] != m.formValues[2] {
+			m.message = m.tr("vault_password_mismatch")
+			m.formValues[1], m.formValues[2] = "", ""
+			return nil
+		}
+		if err := m.store.changeVaultPassword([]byte(m.formValues[0]), []byte(m.formValues[1])); err != nil {
+			m.message = "Save failed: " + err.Error()
+			m.formValues = []string{"", "", ""}
+			return nil
+		}
+		m.message, m.screen, m.formValues = m.tr("vault_password_changed"), settingsScreen, nil
+	case restorePasswordScreen:
+		if m.restoreLegacyNoPass && m.formValues[0] != "" {
+			m.message, m.formValues = m.tr("legacy_no_password"), []string{""}
+			return nil
+		}
+		password := []byte(m.formValues[0])
+		var (
+			data vaultData
+			err  error
+		)
+		data, err = m.store.restoreVaultContents(m.restoreContents, password)
+		if err != nil {
+			m.message, m.formValues = "Restore failed: "+err.Error(), []string{""}
+			return nil
+		}
+		m.data, m.screen, m.cursor, m.message = data, menuScreen, 0, m.tr("restored")
+		m.formValues, m.restoreContents, m.restoreFromWebDAV, m.restoreLegacyNoPass, m.restoreLegacyPassword = nil, nil, false, false, false
 	case webDAVSettingsScreen:
 		if err := m.saveWebDAVSettings(); err != nil {
 			m.message = "Save failed: " + err.Error()
 			return nil
 		}
-		m.message, m.screen, m.formField = m.tr("settings_saved"), backupSettingsScreen, 3
+		m.message, m.screen, m.formField = m.tr("settings_saved"), backupSettingsScreen, 4
 		m.formValues = m.backupFormValues()
 	case languageSettingsScreen:
 		language := m.formValues[0]
@@ -976,7 +1054,7 @@ func (m *model) saveBackupSettings() error {
 }
 
 func (m *model) saveBackupSettingsValues(values []string) error {
-	if len(values) < 3 {
+	if len(values) < 6 {
 		return errors.New("backup settings form is incomplete")
 	}
 	hours, err := strconv.Atoi(strings.TrimSpace(removeNullCharacters(values[1])))
@@ -987,12 +1065,31 @@ func (m *model) saveBackupSettingsValues(values []string) error {
 	if err != nil || maximum < 0 {
 		return errors.New("maximum backup count must be a non-negative number")
 	}
+	previousSettings, previousPassword := m.settings, m.data.BackupPassword
 	backupDir := normalizeBackupDirectory(values[0])
 	if backupDir != m.settings.BackupDir {
 		m.settings.LastBackupAt = ""
 	}
 	m.settings.BackupDir, m.settings.BackupHours, m.settings.BackupMax = backupDir, hours, maximum
-	return m.store.saveSettings(m.settings)
+	m.data.BackupPassword = values[3]
+	passwordChanged := previousPassword != m.data.BackupPassword
+	if passwordChanged {
+		if err := m.store.save(m.data); err != nil {
+			m.settings, m.data.BackupPassword = previousSettings, previousPassword
+			return err
+		}
+	}
+	if err := m.store.saveSettings(m.settings); err != nil {
+		m.settings = previousSettings
+		if passwordChanged {
+			m.data.BackupPassword = previousPassword
+			if rollbackErr := m.store.save(m.data); rollbackErr != nil {
+				return fmt.Errorf("save backup settings: %w; rollback backup password: %v", err, rollbackErr)
+			}
+		}
+		return err
+	}
+	return nil
 }
 
 func (m model) backupFormValues() []string {
@@ -1000,7 +1097,7 @@ func (m model) backupFormValues() []string {
 	if m.data.WebDAV.enabled() {
 		webDAVStatus = "enabled"
 	}
-	return []string{m.settings.BackupDir, strconv.Itoa(m.settings.BackupHours), strconv.Itoa(m.settings.BackupMax), m.tr(webDAVStatus), ""}
+	return []string{m.settings.BackupDir, strconv.Itoa(m.settings.BackupHours), strconv.Itoa(m.settings.BackupMax), m.data.BackupPassword, m.tr(webDAVStatus), ""}
 }
 
 func (m *model) openWebDAVSettings() {
@@ -1013,7 +1110,11 @@ func (m *model) openWebDAVSettings() {
 }
 
 func (m *model) saveWebDAVSettings() error {
-	m.data.WebDAV = m.webDAVConfigFromForm()
+	config := m.webDAVConfigFromForm()
+	if config.enabled() && len(m.data.BackupPassword) == 0 {
+		return errors.New("set a backup password before enabling WebDAV backups")
+	}
+	m.data.WebDAV = config
 	return m.store.save(m.data)
 }
 
@@ -1259,6 +1360,9 @@ func (m model) View() string {
 		if m.screen == webDAVRestoreConfirmScreen {
 			return m.webDAVRestoreConfirmView()
 		}
+		if m.screen == webDAVDeleteConfirmScreen {
+			return m.webDAVDeleteConfirmView()
+		}
 		if m.screen == scriptPickerScreen {
 			return m.scriptPickerView()
 		}
@@ -1320,9 +1424,19 @@ func (m model) formView() string {
 	case commandArgumentsScreen:
 		title, labels = m.tr("command_parameters")+": "+m.commandToRun.Name, m.commandParameters
 	case backupSettingsScreen:
-		title, labels = m.tr("backup_restore"), []string{m.tr("backup_dir"), m.tr("backup_interval"), m.tr("backup_max"), m.tr("webdav_settings"), m.tr("restore_source")}
+		title, labels = m.tr("backup_restore"), []string{m.tr("backup_dir"), m.tr("backup_interval"), m.tr("backup_max"), m.tr("backup_password"), m.tr("webdav_settings"), m.tr("restore_source")}
 	case backupLabelScreen:
 		title, labels = m.backupLabelFormText()
+	case changeVaultPasswordScreen:
+		title, labels = m.tr("change_vault_password"), []string{m.tr("current_vault_password"), m.tr("new_vault_password"), m.tr("confirm_vault_password")}
+	case restorePasswordScreen:
+		title, labels = m.tr("restore_password_title"), []string{m.tr("restore_password")}
+		if m.restoreLegacyNoPass {
+			labels = []string{m.tr("legacy_no_password")}
+		}
+		if m.restoreLegacyPassword {
+			title, labels = m.tr("legacy_vault_title"), []string{m.tr("legacy_vault_password")}
+		}
 	case webDAVSettingsScreen:
 		title, labels = m.tr("webdav_settings"), []string{m.tr("webdav_enabled"), m.tr("webdav_url"), m.tr("webdav_path"), m.tr("webdav_user"), m.tr("webdav_password"), m.tr("webdav_test"), m.tr("cloud_backups"), m.tr("save")}
 	case languageSettingsScreen:
@@ -1350,6 +1464,12 @@ func (m model) formView() string {
 		if m.screen == sessionFormScreen && index == 5 {
 			value = mask(value)
 		}
+		if m.screen == backupSettingsScreen && index == 3 {
+			value = mask(value)
+		}
+		if m.screen == changeVaultPasswordScreen {
+			value = mask(value)
+		}
 		if m.screen == sessionFormScreen && index == 6 {
 			value = m.scriptName(value)
 		}
@@ -1360,6 +1480,9 @@ func (m model) formView() string {
 			value = m.tr(value)
 		}
 		if m.screen == webDAVSettingsScreen && index == 4 {
+			value = mask(value)
+		}
+		if m.screen == restorePasswordScreen && index == 0 {
 			value = mask(value)
 		}
 		if m.screen == scriptFormScreen && index == 2 {
@@ -1626,12 +1749,20 @@ func (m model) updateRestoreConfirm(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "esc", "n":
 		m.screen = backupSettingsScreen
 	case "enter", "y":
-		data, err := m.store.restore(m.restorePath)
+		contents, err := m.store.loadRestoreContents(m.restorePath)
 		if err != nil {
 			m.message, m.screen = "Restore failed: "+err.Error(), backupSettingsScreen
 			return m, nil
 		}
-		m.data, m.screen, m.cursor, m.message = data, menuScreen, 0, m.tr("restored")
+		file, _, err := parseVaultFile(contents)
+		if err != nil {
+			m.message, m.screen = "Restore failed: "+err.Error(), backupSettingsScreen
+			return m, nil
+		}
+		m.restoreContents, m.restoreFromWebDAV = contents, false
+		m.restoreLegacyNoPass = !file.Backup && !file.Password
+		m.restoreLegacyPassword = !file.Backup && file.Password
+		m.screen, m.formField, m.formValues, m.message = restorePasswordScreen, 0, []string{""}, ""
 	}
 	return m, nil
 }
@@ -1645,7 +1776,7 @@ func (m model) checkRemoteBackups() tea.Cmd {
 		return nil
 	}
 	return func() tea.Msg {
-		pulled, err := pullNewWebDAVBackups(config, localDir, maximum)
+		pulled, err := pullNewWebDAVArchives(config, localDir, maximum)
 		return remoteSyncMsg{pulled: pulled, err: err}
 	}
 }
@@ -1702,6 +1833,11 @@ func (m model) updateWebDAVBackups(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if len(m.cloudBackups) > 0 {
 			m.pendingCloudBackup, m.screen = m.cloudBackups[m.cursor], webDAVRestoreConfirmScreen
 		}
+	case "d":
+		if len(m.cloudBackups) == 0 {
+			return m, nil
+		}
+		m.pendingCloudBackup, m.screen = m.cloudBackups[m.cursor], webDAVDeleteConfirmScreen
 	}
 	return m, nil
 }
@@ -1710,12 +1846,28 @@ func (m model) webDAVRestoreConfirmView() string {
 	return m.tr("restore_confirm") + "\n" + m.pendingCloudBackup.Name + "\n\n" + m.tr("restore_help")
 }
 
+func (m model) webDAVDeleteConfirmView() string {
+	return m.tr("delete_webdav_backup") + "\n" + m.pendingCloudBackup.Name + "\n\n" + m.tr("delete_help")
+}
+
+func (m model) updateWebDAVDeleteConfirm(key tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch key.String() {
+	case "esc", "n":
+		m.screen = webDAVBackupsScreen
+	case "enter", "y":
+		config, name := m.data.WebDAV, m.pendingCloudBackup.Name
+		m.screen = webDAVBackupsScreen
+		return m, func() tea.Msg { return webDAVDeleteMsg{name: name, err: deleteWebDAVArchive(config, name)} }
+	}
+	return m, nil
+}
+
 func (m model) updateWebDAVRestoreConfirm(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch key.String() {
 	case "esc", "n":
 		m.screen = webDAVBackupsScreen
 	case "enter", "y":
-		config, name, s := m.data.WebDAV, m.pendingCloudBackup.Name, m.store
+		config, name := m.data.WebDAV, m.pendingCloudBackup.Name
 		return m, func() tea.Msg {
 			archive, err := downloadWebDAVArchive(config, name)
 			if err != nil {
@@ -1725,8 +1877,7 @@ func (m model) updateWebDAVRestoreConfirm(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if err != nil {
 				return webDAVRestoreMsg{err: err}
 			}
-			data, err := s.restoreVaultContents(contents)
-			return webDAVRestoreMsg{data: data, err: err}
+			return webDAVRestoreMsg{contents: contents}
 		}
 	}
 	return m, nil

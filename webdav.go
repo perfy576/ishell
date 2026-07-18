@@ -1,7 +1,6 @@
 package main
 
 import (
-	"archive/zip"
 	"bytes"
 	"encoding/xml"
 	"errors"
@@ -192,48 +191,6 @@ func safeArchiveNamePart(value string) string {
 	return value
 }
 
-func archiveVault(contents []byte) ([]byte, error) {
-	var buffer bytes.Buffer
-	archive := zip.NewWriter(&buffer)
-	entry, err := archive.Create("vault.json")
-	if err != nil {
-		return nil, err
-	}
-	if _, err := entry.Write(contents); err != nil {
-		return nil, err
-	}
-	if err := archive.Close(); err != nil {
-		return nil, err
-	}
-	return buffer.Bytes(), nil
-}
-
-func extractVaultArchive(contents []byte) ([]byte, error) {
-	archive, err := zip.NewReader(bytes.NewReader(contents), int64(len(contents)))
-	if err != nil {
-		return nil, err
-	}
-	for _, entry := range archive.File {
-		if entry.Name != "vault.json" || entry.FileInfo().IsDir() {
-			continue
-		}
-		reader, err := entry.Open()
-		if err != nil {
-			return nil, err
-		}
-		vault, readErr := io.ReadAll(io.LimitReader(reader, 16<<20))
-		closeErr := reader.Close()
-		if readErr != nil {
-			return nil, readErr
-		}
-		if closeErr != nil {
-			return nil, closeErr
-		}
-		return vault, nil
-	}
-	return nil, errors.New("backup archive does not contain vault.json")
-}
-
 func uploadWebDAVArchive(config webDAVConfig, name string, contents []byte, maximum int) error {
 	if !config.configured() {
 		return nil
@@ -361,6 +318,50 @@ func downloadWebDAVArchive(config webDAVConfig, name string) ([]byte, error) {
 		return nil, fmt.Errorf("download WebDAV archive: %s", response.Status)
 	}
 	return io.ReadAll(io.LimitReader(response.Body, 32<<20))
+}
+
+func pullNewWebDAVArchives(config webDAVConfig, localDir string, maximum int) (int, error) {
+	archives, err := listWebDAVArchives(config)
+	if err != nil {
+		return 0, err
+	}
+	pulled := 0
+	for _, archive := range archives {
+		localPath := filepath.Join(localDir, archive.Name)
+		if _, err := os.Stat(localPath); err == nil {
+			continue
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return pulled, err
+		}
+		contents, err := downloadWebDAVArchive(config, archive.Name)
+		if err != nil {
+			return pulled, err
+		}
+		if err := writePrivateFile(localPath, contents); err != nil {
+			return pulled, err
+		}
+		pulled++
+	}
+	return pulled, pruneArchiveBackups(localDir, maximum)
+}
+
+func deleteWebDAVArchive(config webDAVConfig, name string) error {
+	if !strings.HasSuffix(strings.ToLower(name), ".zip") {
+		return errors.New("invalid WebDAV archive name")
+	}
+	target, err := webDAVURL(config, name)
+	if err != nil {
+		return err
+	}
+	response, err := webDAVRequest(config, "DELETE", target, nil, "")
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return fmt.Errorf("delete WebDAV archive: %s", response.Status)
+	}
+	return nil
 }
 
 func pruneWebDAVArchives(config webDAVConfig, maximum int) error {

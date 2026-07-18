@@ -12,9 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"sort"
 	"strings"
-	"time"
 
 	"github.com/zalando/go-keyring"
 	"golang.org/x/crypto/argon2"
@@ -35,6 +33,7 @@ type vaultFile struct {
 	Nonce      string `json:"nonce"`
 	Ciphertext string `json:"ciphertext"`
 	Password   bool   `json:"password"`
+	Backup     bool   `json:"backup,omitempty"`
 }
 
 type session struct {
@@ -79,12 +78,13 @@ type group struct {
 }
 
 type vaultData struct {
-	Groups        []group        `json:"groups"`
-	Sessions      []session      `json:"sessions"`
-	Scripts       []initScript   `json:"scripts"`
-	CommandGroups []commandGroup `json:"command_groups"`
-	Commands      []quickCommand `json:"commands"`
-	WebDAV        webDAVConfig   `json:"webdav"`
+	Groups         []group        `json:"groups"`
+	Sessions       []session      `json:"sessions"`
+	Scripts        []initScript   `json:"scripts"`
+	CommandGroups  []commandGroup `json:"command_groups"`
+	Commands       []quickCommand `json:"commands"`
+	WebDAV         webDAVConfig   `json:"webdav"`
+	BackupPassword string         `json:"backup_password,omitempty"`
 }
 
 type webDAVConfig struct {
@@ -165,34 +165,23 @@ func (s *store) unlock(password []byte) (vaultData, error) {
 	if err != nil {
 		return vaultData{}, err
 	}
-	var file vaultFile
-	if err := json.Unmarshal(contents, &file); err != nil {
-		return vaultData{}, fmt.Errorf("read vault: %w", err)
-	}
-	if file.Version != vaultVersion {
-		return vaultData{}, fmt.Errorf("unsupported vault version %d", file.Version)
-	}
-	salt, err := base64.StdEncoding.DecodeString(file.Salt)
+	file, salt, err := parseVaultFile(contents)
 	if err != nil {
-		return vaultData{}, errors.New("vault salt is invalid")
+		return vaultData{}, err
 	}
-	s.salt, s.password = salt, file.Password
+	var key []byte
 	if file.Password {
 		if len(password) == 0 {
 			return vaultData{}, errors.New("a password is required")
 		}
-		s.key = deriveKey(password, salt)
+		key = deriveKey(password, salt)
 	} else {
-		encoded, err := keyring.Get(appName, keyringUser)
+		key, err = legacySystemKey()
 		if err != nil {
-			return vaultData{}, fmt.Errorf("read vault key from system credential store: %w", err)
-		}
-		s.key, err = base64.StdEncoding.DecodeString(encoded)
-		if err != nil || len(s.key) != 32 {
-			return vaultData{}, errors.New("system credential store returned an invalid vault key")
+			return vaultData{}, err
 		}
 	}
-	plaintext, err := decrypt(s.key, file)
+	plaintext, err := decrypt(key, file)
 	if err != nil {
 		return vaultData{}, errors.New("could not unlock vault: password may be incorrect or data damaged")
 	}
@@ -200,6 +189,7 @@ func (s *store) unlock(password []byte) (vaultData, error) {
 	if err := json.Unmarshal(plaintext, &data); err != nil {
 		return vaultData{}, fmt.Errorf("decode vault: %w", err)
 	}
+	s.salt, s.key, s.password = salt, key, file.Password
 	return data, nil
 }
 
@@ -220,6 +210,70 @@ func (s *store) save(data vaultData) error {
 		return err
 	}
 	return writePrivateFile(s.vaultPath, contents)
+}
+
+func (s *store) changeVaultPassword(currentPassword, newPassword []byte) error {
+	contents, err := os.ReadFile(s.vaultPath)
+	if err != nil {
+		return err
+	}
+	file, salt, err := parseVaultFile(contents)
+	if err != nil {
+		return err
+	}
+	currentKey := s.key
+	if file.Password {
+		if len(currentPassword) == 0 {
+			return errors.New("current vault password is required")
+		}
+		currentKey = deriveKey(currentPassword, salt)
+	} else if len(currentPassword) != 0 {
+		return errors.New("this vault has no password; leave the current password empty")
+	}
+	plaintext, err := decrypt(currentKey, file)
+	if err != nil {
+		return errors.New("current vault password is incorrect or data is damaged")
+	}
+	newSalt := make([]byte, 16)
+	if _, err := io.ReadFull(rand.Reader, newSalt); err != nil {
+		return err
+	}
+	passwordEnabled := len(newPassword) != 0
+	var newKey []byte
+	var previousStoredKey string
+	var previousStoredKeyErr error
+	if passwordEnabled {
+		newKey = deriveKey(newPassword, newSalt)
+	} else {
+		newKey = make([]byte, 32)
+		if _, err := io.ReadFull(rand.Reader, newKey); err != nil {
+			return err
+		}
+		previousStoredKey, previousStoredKeyErr = keyring.Get(appName, keyringUser)
+		if err := keyring.Set(appName, keyringUser, base64.StdEncoding.EncodeToString(newKey)); err != nil {
+			return fmt.Errorf("set system vault key: %w", err)
+		}
+	}
+	updated, err := encrypt(newKey, newSalt, passwordEnabled, plaintext)
+	if err != nil {
+		return err
+	}
+	encoded, err := json.MarshalIndent(updated, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := writePrivateFile(s.vaultPath, encoded); err != nil {
+		if !passwordEnabled {
+			if previousStoredKeyErr == nil {
+				_ = keyring.Set(appName, keyringUser, previousStoredKey)
+			} else {
+				_ = keyring.Delete(appName, keyringUser)
+			}
+		}
+		return err
+	}
+	s.key, s.salt, s.password = newKey, newSalt, passwordEnabled
+	return nil
 }
 
 func (s *store) readSettings() (settings, error) {
@@ -252,150 +306,16 @@ func (s *store) saveSettings(value settings) error {
 	return writePrivateFile(s.settingsPath, contents)
 }
 
-func (s *store) backup(value settings, webdav webDAVConfig, label string) (settings, error) {
-	contents, err := os.ReadFile(s.vaultPath)
+func legacySystemKey() ([]byte, error) {
+	encoded, err := keyring.Get(appName, keyringUser)
 	if err != nil {
-		return value, err
+		return nil, fmt.Errorf("read legacy system vault key: %w", err)
 	}
-	backupDir := normalizeBackupDirectory(value.BackupDir)
-	if backupDir == "" {
-		backupDir = s.dir
+	key, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil || len(key) != 32 {
+		return nil, errors.New("legacy system credential store returned an invalid vault key")
 	}
-	if err := os.MkdirAll(backupDir, 0700); err != nil {
-		return value, err
-	}
-	name := webDAVArchiveName(webdav, time.Now(), label)
-	archive, err := archiveVault(contents)
-	if err != nil {
-		return value, err
-	}
-	if err := writePrivateFile(filepath.Join(backupDir, name), archive); err != nil {
-		return value, err
-	}
-	if err := pruneArchiveBackups(backupDir, value.BackupMax); err != nil {
-		return value, err
-	}
-	if err := uploadWebDAVArchive(webdav, name, archive, value.BackupMax); err != nil {
-		return value, err
-	}
-	value.LastBackupAt = time.Now().UTC().Format(time.RFC3339)
-	return value, s.saveSettings(value)
-}
-
-func (s *store) restore(source string) (vaultData, error) {
-	path := strings.TrimSpace(source)
-	info, err := os.Stat(path)
-	if err != nil {
-		return vaultData{}, err
-	}
-	if info.IsDir() {
-		path = filepath.Join(path, "vault.json")
-	}
-	contents, err := os.ReadFile(path)
-	if err != nil {
-		return vaultData{}, err
-	}
-	if strings.EqualFold(filepath.Ext(path), ".zip") {
-		contents, err = extractVaultArchive(contents)
-		if err != nil {
-			return vaultData{}, err
-		}
-	}
-	return s.restoreVaultContents(contents)
-}
-
-func (s *store) restoreVaultContents(contents []byte) (vaultData, error) {
-	var file vaultFile
-	if err := json.Unmarshal(contents, &file); err != nil {
-		return vaultData{}, fmt.Errorf("read backup vault: %w", err)
-	}
-	if file.Version != vaultVersion || file.Password != s.password {
-		return vaultData{}, errors.New("backup vault is incompatible with the current vault")
-	}
-	plaintext, err := decrypt(s.key, file)
-	if err != nil {
-		return vaultData{}, errors.New("backup cannot be unlocked with the current vault key")
-	}
-	var data vaultData
-	if err := json.Unmarshal(plaintext, &data); err != nil {
-		return vaultData{}, fmt.Errorf("decode backup vault: %w", err)
-	}
-	if err := writePrivateFile(s.vaultPath, contents); err != nil {
-		return vaultData{}, err
-	}
-	return data, nil
-}
-
-func pruneBackups(root string, maximum int) error {
-	if maximum <= 0 {
-		return nil
-	}
-	entries, err := os.ReadDir(root)
-	if err != nil {
-		return err
-	}
-	var names []string
-	for _, entry := range entries {
-		if entry.IsDir() && isBackupName(entry.Name()) {
-			names = append(names, entry.Name())
-		}
-	}
-	sort.Strings(names)
-	for len(names) > maximum {
-		if err := os.RemoveAll(filepath.Join(root, names[0])); err != nil {
-			return err
-		}
-		names = names[1:]
-	}
-	return nil
-}
-
-func pruneArchiveBackups(root string, maximum int) error {
-	if maximum <= 0 {
-		return nil
-	}
-	entries, err := os.ReadDir(root)
-	if err != nil {
-		return err
-	}
-	var names []string
-	for _, entry := range entries {
-		if !entry.IsDir() && strings.HasSuffix(strings.ToLower(entry.Name()), ".zip") {
-			names = append(names, entry.Name())
-		}
-	}
-	sort.Strings(names)
-	for len(names) > maximum {
-		if err := os.Remove(filepath.Join(root, names[0])); err != nil {
-			return err
-		}
-		names = names[1:]
-	}
-	return nil
-}
-
-func isBackupName(name string) bool {
-	stamp, found := strings.CutPrefix(name, "ishell-")
-	if !found {
-		return false
-	}
-	_, err := time.Parse("20060102-150405", stamp)
-	return err == nil
-}
-
-func (s *store) backupIfDue(value settings, webdav webDAVConfig) (settings, error) {
-	if value.BackupHours <= 0 {
-		return value, nil
-	}
-	last, err := time.Parse(time.RFC3339, value.LastBackupAt)
-	if err == nil && time.Since(last) < time.Duration(value.BackupHours)*time.Hour {
-		return value, nil
-	}
-	return s.backup(value, webdav, "auto")
-}
-
-func normalizeBackupDirectory(value string) string {
-	return strings.TrimSpace(removeNullCharacters(value))
+	return key, nil
 }
 
 func removeNullCharacters(value string) string {
@@ -404,6 +324,21 @@ func removeNullCharacters(value string) string {
 
 func deriveKey(password, salt []byte) []byte {
 	return argon2.IDKey(password, salt, 3, 64*1024, 4, 32)
+}
+
+func parseVaultFile(contents []byte) (vaultFile, []byte, error) {
+	var file vaultFile
+	if err := json.Unmarshal(contents, &file); err != nil {
+		return vaultFile{}, nil, err
+	}
+	if file.Version != vaultVersion {
+		return vaultFile{}, nil, fmt.Errorf("unsupported vault version %d", file.Version)
+	}
+	salt, err := base64.StdEncoding.DecodeString(file.Salt)
+	if err != nil || len(salt) != 16 {
+		return vaultFile{}, nil, errors.New("vault salt is invalid")
+	}
+	return file, salt, nil
 }
 
 func encrypt(key, salt []byte, password bool, plaintext []byte) (vaultFile, error) {

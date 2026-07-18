@@ -1,6 +1,7 @@
 package main
 
 import (
+	"archive/zip"
 	"bufio"
 	"bytes"
 	"crypto/sha256"
@@ -42,6 +43,39 @@ func TestVaultEncryptionRoundTrip(t *testing.T) {
 	}
 	if _, err := decrypt(bytes.Repeat([]byte{3}, 32), file); err == nil {
 		t.Fatal("wrong key decrypted vault")
+	}
+}
+
+func TestChangeVaultPasswordReencryptsData(t *testing.T) {
+	dir := t.TempDir()
+	oldPassword := []byte("old-password")
+	salt := bytes.Repeat([]byte{2}, 16)
+	s := &store{dir: dir, vaultPath: filepath.Join(dir, "vault.json"), key: deriveKey(oldPassword, salt), salt: salt, password: true}
+	want := vaultData{Sessions: []session{{ID: "session", Name: "Production"}}}
+	if err := s.save(want); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(s.vaultPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.changeVaultPassword([]byte("wrong-password"), []byte("new-password")); err == nil {
+		t.Fatal("wrong current password changed the vault")
+	}
+	afterFailedChange, err := os.ReadFile(s.vaultPath)
+	if err != nil || !bytes.Equal(before, afterFailedChange) {
+		t.Fatalf("failed password change modified vault: %v", err)
+	}
+	if err := s.changeVaultPassword(oldPassword, []byte("new-password")); err != nil {
+		t.Fatal(err)
+	}
+	reader := &store{vaultPath: s.vaultPath}
+	restored, err := reader.unlock([]byte("new-password"))
+	if err != nil || len(restored.Sessions) != 1 || restored.Sessions[0].ID != "session" {
+		t.Fatalf("new password did not unlock data: %#v, %v", restored, err)
+	}
+	if _, err := (&store{vaultPath: s.vaultPath}).unlock(oldPassword); err == nil {
+		t.Fatal("old password unlocked the re-encrypted vault")
 	}
 }
 
@@ -94,7 +128,7 @@ func TestReadSettingsNormalizesNullBackupDirectory(t *testing.T) {
 func TestBackupSettingsNormalizeNullCharacters(t *testing.T) {
 	dir := t.TempDir()
 	m := newModel(&store{settingsPath: filepath.Join(dir, "settings.json")}, vaultData{}, settings{})
-	if err := m.saveBackupSettingsValues([]string{"\x00", "\x000", "\x000", "", ""}); err != nil {
+	if err := m.saveBackupSettingsValues([]string{"\x00", "\x000", "\x000", "", "", ""}); err != nil {
 		t.Fatal(err)
 	}
 	if m.settings.BackupDir != "" || m.settings.BackupHours != 0 || m.settings.BackupMax != 0 {
@@ -538,11 +572,48 @@ func TestWebDAVUploadAndPull(t *testing.T) {
 }
 
 func TestWebDAVArchiveRoundTripAndPermissionTest(t *testing.T) {
-	archiveContents, err := archiveVault([]byte("encrypted-vault"))
+	file, err := encrypt(bytes.Repeat([]byte{1}, 32), bytes.Repeat([]byte{2}, 16), true, []byte(`{"groups":[{"name":"production"}]}`))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if vault, err := extractVaultArchive(archiveContents); err != nil || string(vault) != "encrypted-vault" {
+	vaultContents, err := json.Marshal(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	archiveContents, err := archiveVault(vaultContents)
+	if err != nil {
+		t.Fatal(err)
+	}
+	archive, err := zip.NewReader(bytes.NewReader(archiveContents), int64(len(archiveContents)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries := make(map[string]bool)
+	var metadata vaultBackupMetadata
+	for _, entry := range archive.File {
+		entries[entry.Name] = true
+		if entry.Name == "metadata.json" {
+			reader, err := entry.Open()
+			if err != nil {
+				t.Fatal(err)
+			}
+			contents, err := io.ReadAll(reader)
+			closeErr := reader.Close()
+			if err != nil || closeErr != nil {
+				t.Fatalf("read backup metadata: %v %v", err, closeErr)
+			}
+			if err := json.Unmarshal(contents, &metadata); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if !entries["metadata.json"] || !entries["vault.enc"] || entries["vault.json"] {
+		t.Fatalf("unexpected backup entries: %#v", entries)
+	}
+	if metadata.BackupVersion != 1 || metadata.VaultVersion != vaultVersion || metadata.CreatedAt == "" || metadata.SourceHost == "" || metadata.AppVersion != appVersion {
+		t.Fatalf("unexpected backup metadata: %#v", metadata)
+	}
+	if vault, err := extractVaultArchive(archiveContents); err != nil || string(vault) != string(vaultContents) {
 		t.Fatalf("archive extraction = %q, %v", vault, err)
 	}
 	name := "backup-user-20260717230000.zip"
@@ -582,6 +653,51 @@ func TestWebDAVArchiveRoundTripAndPermissionTest(t *testing.T) {
 	downloaded, err := downloadWebDAVArchive(config, name)
 	if err != nil || !bytes.Equal(downloaded, archiveContents) {
 		t.Fatalf("downloaded archive = %d bytes, %v", len(downloaded), err)
+	}
+}
+
+func TestDeleteWebDAVArchive(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method != "DELETE" || request.URL.Path != "/backups/archive.zip" {
+			t.Fatalf("delete request = %s %s", request.Method, request.URL.Path)
+		}
+		writer.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	if err := deleteWebDAVArchive(webDAVConfig{URL: server.URL, Path: "backups"}, "archive.zip"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPullNewWebDAVArchives(t *testing.T) {
+	const name = "host-user-20260718120000-auto.zip"
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.Method {
+		case "PROPFIND":
+			if request.URL.Path != "/backups/" {
+				t.Fatalf("archive collection path = %q", request.URL.Path)
+			}
+			writer.Header().Set("Content-Type", "application/xml")
+			writer.WriteHeader(207)
+			fmt.Fprintf(writer, `<multistatus xmlns="DAV:"><response><href>/backups/%s</href></response></multistatus>`, name)
+		case "GET":
+			if request.URL.Path != "/backups/"+name {
+				t.Fatalf("archive download path = %q", request.URL.Path)
+			}
+			_, _ = writer.Write([]byte("archive"))
+		default:
+			t.Fatalf("unexpected method %s", request.Method)
+		}
+	}))
+	defer server.Close()
+	dir := t.TempDir()
+	pulled, err := pullNewWebDAVArchives(webDAVConfig{URL: server.URL, Path: "backups"}, dir, 0)
+	if err != nil || pulled != 1 {
+		t.Fatalf("pulled = %d, %v", pulled, err)
+	}
+	contents, err := os.ReadFile(filepath.Join(dir, name))
+	if err != nil || string(contents) != "archive" {
+		t.Fatalf("downloaded archive = %q, %v", contents, err)
 	}
 }
 
@@ -633,7 +749,7 @@ func TestManualBackupPromptsForLabel(t *testing.T) {
 	m.screen, m.formValues = backupSettingsScreen, m.backupFormValues()
 	updated, _ := m.updateForm(tea.KeyMsg{Type: tea.KeyCtrlB})
 	result := updated.(model)
-	if result.screen != backupLabelScreen || len(result.formValues) != 1 || result.formValues[0] != "" || len(result.manualBackupValues) != 5 {
+	if result.screen != backupLabelScreen || len(result.formValues) != 1 || result.formValues[0] != "" || len(result.manualBackupValues) != 6 {
 		t.Fatalf("manual backup should prompt for a label: %#v", result)
 	}
 }
@@ -699,7 +815,7 @@ func TestExistingWebDAVCollectionIsProbedBeforeCreation(t *testing.T) {
 func TestWebDAVSettingsUseNestedScreenAndHaveToggle(t *testing.T) {
 	s := &store{settingsPath: filepath.Join(t.TempDir(), "settings.json")}
 	m := newModel(s, vaultData{WebDAV: webDAVConfig{URL: "https://example.test"}}, settings{})
-	m.screen, m.formField, m.formValues = backupSettingsScreen, 3, m.backupFormValues()
+	m.screen, m.formField, m.formValues = backupSettingsScreen, 4, m.backupFormValues()
 
 	updated, _ := m.updateForm(tea.KeyMsg{Type: tea.KeyEnter})
 	nested := updated.(model)
@@ -741,7 +857,7 @@ func TestCloudBackupsUsesCurrentWebDAVFormConfiguration(t *testing.T) {
 
 	dir := t.TempDir()
 	s := &store{dir: dir, vaultPath: filepath.Join(dir, "vault.json"), key: bytes.Repeat([]byte{1}, 32), salt: bytes.Repeat([]byte{2}, 16), password: true}
-	m := newModel(s, vaultData{}, settings{})
+	m := newModel(s, vaultData{BackupPassword: "backup-password"}, settings{})
 	m.screen, m.formField = webDAVSettingsScreen, 6
 	m.formValues = []string{"enabled", server.URL, "ishell", "", "", "Test configuration", "Cloud backups", "Save"}
 	updated, command := m.updateForm(tea.KeyMsg{Type: tea.KeyEnter})
@@ -762,9 +878,26 @@ func TestWebDAVBackupCursorMovementClearsMessage(t *testing.T) {
 	}
 }
 
+func TestWebDAVBackupDeleteRequiresConfirmation(t *testing.T) {
+	m := newModel(nil, vaultData{}, settings{})
+	m.screen = webDAVBackupsScreen
+	m.cloudBackups = []webDAVArchive{{Name: "backup.zip"}}
+	updated, command := m.updateWebDAVBackups(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("d")})
+	result := updated.(model)
+	if command != nil || result.screen != webDAVDeleteConfirmScreen || result.pendingCloudBackup.Name != "backup.zip" {
+		t.Fatalf("delete should require confirmation: %#v", result)
+	}
+	updated, _ = result.updateWebDAVDeleteConfirm(tea.KeyMsg{Type: tea.KeyEsc})
+	if updated.(model).screen != webDAVBackupsScreen {
+		t.Fatal("canceling delete should return to the backup list")
+	}
+}
+
 func TestRestoreReplacesVaultOnlyAfterValidation(t *testing.T) {
 	dir := t.TempDir()
-	s := &store{dir: dir, vaultPath: filepath.Join(dir, "vault.json"), key: bytes.Repeat([]byte{1}, 32), salt: bytes.Repeat([]byte{2}, 16), password: true}
+	password := []byte("backup-password")
+	salt := bytes.Repeat([]byte{2}, 16)
+	s := &store{dir: dir, vaultPath: filepath.Join(dir, "vault.json"), key: deriveKey(password, salt), salt: salt, password: true}
 	backupData := vaultData{Sessions: []session{{ID: "backup", Name: "Backup session"}}}
 	if err := s.save(backupData); err != nil {
 		t.Fatal(err)
@@ -783,14 +916,178 @@ func TestRestoreReplacesVaultOnlyAfterValidation(t *testing.T) {
 	if err := s.save(vaultData{Sessions: []session{{ID: "current", Name: "Current session"}}}); err != nil {
 		t.Fatal(err)
 	}
-	restored, err := s.restore(backupDir)
+	restored, err := s.restore(backupDir, password)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(restored.Sessions) != 1 || restored.Sessions[0].ID != "backup" {
 		t.Fatalf("unexpected restored data: %#v", restored)
 	}
-	if _, err := s.restore(filepath.Join(dir, "missing")); err == nil {
+	if _, err := s.restore(filepath.Join(dir, "missing"), password); err == nil {
 		t.Fatal("missing backup should not restore")
+	}
+}
+
+func TestRestoreUsesWebDAVBackupPassword(t *testing.T) {
+	dir := t.TempDir()
+	backupPassword := []byte("backup-password")
+	sourcePassword := []byte("source-password")
+	sourceSalt := bytes.Repeat([]byte{2}, 16)
+	sourceDir := filepath.Join(dir, "source")
+	source := &store{dir: sourceDir, vaultPath: filepath.Join(sourceDir, "vault.json"), settingsPath: filepath.Join(sourceDir, "settings.json"), key: deriveKey(sourcePassword, sourceSalt), salt: sourceSalt, password: true}
+	want := vaultData{Sessions: []session{{ID: "backup", Name: "Backup session"}}}
+	if err := source.save(want); err != nil {
+		t.Fatal(err)
+	}
+	backupDir := filepath.Join(dir, "backups")
+	if _, err := source.backup(settings{BackupDir: backupDir}, want.WebDAV, string(backupPassword), "manual"); err != nil {
+		t.Fatal(err)
+	}
+	archives, err := filepath.Glob(filepath.Join(backupDir, "*.zip"))
+	if err != nil || len(archives) != 1 {
+		t.Fatalf("backup archive = %#v, %v", archives, err)
+	}
+	localPassword := []byte("target-password")
+	localSalt := bytes.Repeat([]byte{3}, 16)
+	targetDir := filepath.Join(dir, "target")
+	target := &store{dir: targetDir, vaultPath: filepath.Join(targetDir, "vault.json"), key: deriveKey(localPassword, localSalt), salt: localSalt, password: true}
+	if err := target.save(vaultData{Sessions: []session{{ID: "local", Name: "Local session"}}}); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(target.vaultPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := target.restore(archives[0], []byte("wrong-password")); err == nil {
+		t.Fatal("wrong backup password restored the vault")
+	}
+	afterFailedRestore, err := os.ReadFile(target.vaultPath)
+	if err != nil || !bytes.Equal(before, afterFailedRestore) {
+		t.Fatalf("failed restore changed vault: %v", err)
+	}
+
+	restored, err := target.restore(archives[0], backupPassword)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(restored.Sessions) != 1 || restored.Sessions[0].ID != "backup" {
+		t.Fatalf("unexpected restored data: %#v", restored)
+	}
+	if !bytes.Equal(target.salt, localSalt) || !target.password {
+		t.Fatalf("restored vault should retain local protection = salt %x, password %v", target.salt, target.password)
+	}
+	if _, err := target.unlock(localPassword); err != nil {
+		t.Fatalf("restored vault could not be reopened with local startup password: %v", err)
+	}
+}
+
+func TestBackupRestorePreservesCrossPlatformQuickCommands(t *testing.T) {
+	dir := t.TempDir()
+	backupPassword := "backup-password"
+	sourcePassword := []byte("source-password")
+	sourceSalt := bytes.Repeat([]byte{9}, 16)
+	sourceDir := filepath.Join(dir, "source")
+	foreignPlatform := "darwin"
+	if runtime.GOOS == "darwin" {
+		foreignPlatform = "windows"
+	}
+	want := vaultData{
+		Sessions: []session{{ID: "session", Name: "Shared SSH", Protocol: "ssh", Host: "example.test", Port: "22"}},
+		Scripts:  []initScript{{ID: "script", Name: "Shared init", Interpreter: "sh", Content: "cd /srv"}},
+		Commands: []quickCommand{
+			{ID: "local", Name: "Local", Command: "echo local", Platform: runtime.GOOS},
+			{ID: "foreign", Name: "Foreign", Command: "echo foreign", Platform: foreignPlatform},
+		},
+	}
+	source := &store{dir: sourceDir, vaultPath: filepath.Join(sourceDir, "vault.json"), settingsPath: filepath.Join(sourceDir, "settings.json"), key: deriveKey(sourcePassword, sourceSalt), salt: sourceSalt, password: true}
+	if err := source.save(want); err != nil {
+		t.Fatal(err)
+	}
+	backupDir := filepath.Join(dir, "backups")
+	if _, err := source.backup(settings{BackupDir: backupDir}, want.WebDAV, backupPassword, "cross-platform"); err != nil {
+		t.Fatal(err)
+	}
+	archives, err := filepath.Glob(filepath.Join(backupDir, "*.zip"))
+	if err != nil || len(archives) != 1 {
+		t.Fatalf("backup archive = %#v, %v", archives, err)
+	}
+	targetSalt := bytes.Repeat([]byte{10}, 16)
+	targetDir := filepath.Join(dir, "target")
+	target := &store{dir: targetDir, vaultPath: filepath.Join(targetDir, "vault.json"), key: deriveKey([]byte("target-password"), targetSalt), salt: targetSalt, password: true}
+	if err := target.save(vaultData{}); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := target.restore(archives[0], []byte(backupPassword))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(restored.Sessions) != 1 || len(restored.Scripts) != 1 || len(restored.Commands) != 2 {
+		t.Fatalf("cross-platform data was lost: %#v", restored)
+	}
+	if restored.Commands[0].Platform != runtime.GOOS || restored.Commands[1].Platform != foreignPlatform {
+		t.Fatalf("command platforms changed during restore: %#v", restored.Commands)
+	}
+	m := newModel(target, restored, settings{})
+	m.mode = commandMode
+	rows := m.commandRows()
+	if !strings.Contains(rows[1].label, "[x] ") {
+		t.Fatalf("foreign command is not marked unavailable: %#v", rows)
+	}
+	if strings.Contains(rows[0].label, "[x] ") {
+		t.Fatalf("local command was incorrectly marked unavailable: %#v", rows)
+	}
+}
+
+func TestRestoreDeviceBoundBackupRejectsDifferentSystemKey(t *testing.T) {
+	dir := t.TempDir()
+	salt := bytes.Repeat([]byte{2}, 16)
+	source := &store{dir: dir, vaultPath: filepath.Join(dir, "backup.json"), key: bytes.Repeat([]byte{1}, 32), salt: salt}
+	if err := source.save(vaultData{}); err != nil {
+		t.Fatal(err)
+	}
+	backup, err := os.ReadFile(source.vaultPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := &store{dir: dir, vaultPath: filepath.Join(dir, "vault.json"), key: bytes.Repeat([]byte{3}, 32), salt: bytes.Repeat([]byte{4}, 16)}
+	if _, err := target.restoreVaultContents(backup, nil); err == nil {
+		t.Fatal("device-bound backup decrypted with a different system key")
+	}
+}
+
+func TestLegacyNoPasswordRestoreRequiresCurrentVaultPassword(t *testing.T) {
+	dir := t.TempDir()
+	key := bytes.Repeat([]byte{1}, 32)
+	source := &store{dir: dir, vaultPath: filepath.Join(dir, "backup.json"), key: key, salt: bytes.Repeat([]byte{2}, 16)}
+	if err := source.save(vaultData{Sessions: []session{{ID: "legacy", Name: "Legacy session"}}}); err != nil {
+		t.Fatal(err)
+	}
+	contents, err := os.ReadFile(source.vaultPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := &store{dir: dir, vaultPath: filepath.Join(dir, "vault.json"), key: key, salt: bytes.Repeat([]byte{3}, 16)}
+	if _, err := target.restoreVaultContents(contents, []byte("not-a-password")); err == nil {
+		t.Fatal("legacy no-password vault accepted a non-empty password")
+	}
+	if _, err := target.restoreVaultContents(contents, nil); err == nil {
+		t.Fatal("legacy no-password vault accepted an empty password")
+	}
+}
+
+func TestRestoreRejectsUnsupportedVaultVersion(t *testing.T) {
+	file, err := encrypt(bytes.Repeat([]byte{1}, 32), bytes.Repeat([]byte{2}, 16), true, []byte(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	file.Version = vaultVersion + 1
+	contents, err := json.Marshal(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	target := &store{dir: dir, vaultPath: filepath.Join(dir, "vault.json"), key: bytes.Repeat([]byte{1}, 32), salt: bytes.Repeat([]byte{2}, 16), password: true}
+	if _, err := target.restoreVaultContents(contents, []byte("password")); err == nil {
+		t.Fatal("unsupported vault version was restored")
 	}
 }

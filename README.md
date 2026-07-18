@@ -19,7 +19,6 @@ iShell 是一个运行在现有终端中的全屏 Shell 会话管理器。它不
 
 - Go 1.26 或更高版本
 - SSH 会话需要系统提供 `ssh` 命令
-- macOS 无密码 vault 使用 Keychain；Windows 使用 Credential Manager；Linux 使用 Secret Service
 
 ## 快速开始
 
@@ -37,7 +36,7 @@ go build -o ishell.exe .
 .\ishell.exe
 ```
 
-首次启动时设置 vault 密码。留空时，iShell 会生成随机密钥并存入操作系统凭证存储；如果系统凭证存储不可用，无密码模式会失败，请设置 vault 密码。
+首次启动时可设置 vault 密码。留空时，iShell 会生成随机 key 并存入操作系统凭证存储，本地 vault 仍由 AES-256-GCM 加密。
 
 ## 数据与安全
 
@@ -49,8 +48,8 @@ go build -o ishell.exe .
 
 vault 使用以下方式保护：
 
-- 设置 vault 密码：随机 salt 与密码经 Argon2id 派生密钥，再使用 AES-256-GCM 加密。
-- 未设置 vault 密码：随机 vault key 保存到系统凭证存储，数据仍由 AES-256-GCM 加密。
+- 设置 vault 密码时，随机 salt 与密码经 Argon2id 派生密钥，再使用 AES-256-GCM 加密本地数据。
+- 未设置 vault 密码时，随机 vault key 保存到系统凭证存储，数据仍由 AES-256-GCM 加密。
 
 `~/.ishell/settings.json` 仅保存备份位置、保留策略和语言设置，不含主机、账号或密码。
 
@@ -119,22 +118,22 @@ vault 使用以下方式保护：
 iShell 会在启动时检查一次备份，并在运行期间每分钟检查是否到期。每份备份保存为：
 
 ```text
-<备份目录>/ishell-YYYYMMDD-HHMMSS/vault.json
+<备份目录>/<主机名>-<WebDAV 用户名>-YYYYMMDDHHMMSS-<标签>.zip
 ```
 
-备份包含完整加密 vault 和 salt，不会生成明文凭证。超过保留数量时，只会清理符合 iShell 时间命名规则的旧备份目录。
+每份备份 zip 仅包含公开的 `metadata.json`（备份格式版本、vault 版本、创建时间、来源主机、app 版本和 salt）以及加密的 `vault.enc`（AES-GCM nonce 和密文），不会生成明文凭证。创建备份时，iShell 先在内存中解密本地 vault，再用独立的备份密码和随机 salt 重新加密 zip；该密码保存在加密 vault 中以支持自动备份，也用于跨设备恢复。超过保留数量时，只会清理符合 iShell 备份命名规则的旧备份。
 
 当前不提供 cron、Windows 任务计划程序或其他后台调度；iShell 退出后不会继续执行自动备份。
 
 ### WebDAV 同步
 
-每次本地备份成功后，iShell 将加密的 `vault.json` 推送到 WebDAV，远端目录结构与本地一致。启动 iShell 时，以及打开“备份与恢复”时，程序会后台检查远端是否存在本地缺少的备份；发现后会下载到本地备份目录，并按最大保留数清理旧备份。
+每次本地备份成功后，iShell 将加密的 zip 推送到 WebDAV，远端目录结构与本地一致。启动 iShell 时，以及打开“备份与恢复”时，程序会后台检查远端是否存在本地缺少的备份；发现后会下载到本地备份目录，并按最大保留数清理旧备份。
 
 WebDAV 使用 Basic Authentication。请优先使用 `https://` 地址，避免在网络中暴露凭证。
 
 ### 恢复备份
 
-在“备份与恢复”的“备份目录或 `vault.json`”字段输入某个备份目录，或直接输入其 `vault.json` 文件路径，按 `Ctrl+R` 后确认即可恢复。iShell 会先验证备份能够用当前 vault 密钥解密，验证失败不会覆盖当前数据。恢复成功后会立即替换当前分组、会话、脚本库和 WebDAV 配置。
+在“备份与恢复”的“备份目录或 `vault.json`”字段输入 zip 文件路径，或输入旧版备份目录/`vault.json` 文件路径，按 `Ctrl+R` 后确认即可恢复。程序会先读取备份 metadata，按格式版本选择恢复流程；新格式 zip 要求输入备份密码。验证失败不会覆盖当前数据；恢复成功后，数据会立即使用当前设备的 vault 保护方式重新加密，并替换当前分组、会话、脚本库和 WebDAV 配置。
 
 ## 语言
 
