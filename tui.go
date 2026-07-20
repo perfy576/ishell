@@ -1104,9 +1104,6 @@ func (m *model) openWebDAVSettings() {
 
 func (m *model) saveWebDAVSettings() error {
 	config := m.webDAVConfigFromForm()
-	if config.enabled() && len(m.data.BackupPassword) == 0 {
-		return errors.New("set a backup password before enabling WebDAV backups")
-	}
 	m.data.WebDAV = config
 	return m.store.save(m.data)
 }

@@ -821,6 +821,25 @@ func TestWebDAVSettingsUseNestedScreenAndHaveToggle(t *testing.T) {
 	}
 }
 
+func TestWebDAVSettingsCanBeSavedBeforeBackupPassword(t *testing.T) {
+	dir := t.TempDir()
+	vaultPassword := []byte("vault-password")
+	salt := bytes.Repeat([]byte{1}, 16)
+	s := &store{dir: dir, vaultPath: filepath.Join(dir, "vault.json"), key: deriveKey(vaultPassword, salt), salt: salt, password: true}
+	m := newModel(s, vaultData{}, settings{})
+	m.formValues = []string{"enabled", "https://example.test", "ishell", "alice", "secret", "Test configuration", "Cloud backups", "Save"}
+	if err := m.saveWebDAVSettings(); err != nil {
+		t.Fatalf("save WebDAV settings before setting backup password: %v", err)
+	}
+	restored, err := s.unlock(vaultPassword)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !restored.WebDAV.configured() || restored.WebDAV.URL != "https://example.test" || restored.WebDAV.Path != "ishell" || restored.WebDAV.Username != "alice" || restored.WebDAV.Password != "secret" {
+		t.Fatal("WebDAV settings were not persisted")
+	}
+}
+
 func TestWebDAVFocusChangeClearsTestMessage(t *testing.T) {
 	m := newModel(nil, vaultData{}, settings{})
 	m.screen, m.formField = webDAVSettingsScreen, 5
