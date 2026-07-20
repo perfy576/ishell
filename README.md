@@ -36,6 +36,16 @@ go build -o ishell.exe .
 .\ishell.exe
 ```
 
+## 安装到 PATH
+
+构建完成后执行：
+
+```sh
+./ishell install
+```
+
+macOS/Linux 会将程序复制到 `~/.ishell/bin/ishell`，并把该目录写入当前 shell 的启动文件；打开新终端后可直接运行 `ishell`。Windows 会将 `~/.ishell/bin` 写入用户 PATH。移除安装可执行 `ishell uninstall`。
+
 首次启动时可设置 vault 密码。留空时，iShell 会生成随机 key 并存入操作系统凭证存储，本地 vault 仍由 AES-256-GCM 加密。
 
 ## 数据与安全

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -16,7 +17,7 @@ func runInstall() {
 		fatal(err)
 	}
 	fmt.Println("iShell installed at " + path)
-	fmt.Println("Open a new terminal and run ishell.exe.")
+	fmt.Println("Open a new terminal and run " + filepath.Base(path) + ".")
 }
 
 func runUninstall() {
