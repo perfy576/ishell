@@ -1550,9 +1550,6 @@ func (m model) formView() string {
 		if m.screen == sessionFormScreen && index == 5 {
 			value = mask(value)
 		}
-		if m.screen == backupSettingsScreen && index == 3 {
-			value = mask(value)
-		}
 		if m.screen == changeVaultPasswordScreen {
 			value = mask(value)
 		}
@@ -1568,7 +1565,7 @@ func (m model) formView() string {
 		if m.screen == webDAVSettingsScreen && index == 4 {
 			value = mask(value)
 		}
-		if m.screen == restorePasswordScreen && index == 0 {
+		if m.screen == restorePasswordScreen && index == 0 && m.restoreLegacyPassword {
 			value = mask(value)
 		}
 		if m.screen == scriptFormScreen && index == 2 {

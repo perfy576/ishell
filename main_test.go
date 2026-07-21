@@ -237,6 +237,27 @@ func TestMutationFormsExposePrimaryAndCancelActions(t *testing.T) {
 	}
 }
 
+func TestBackupPasswordsDisplayInPlainText(t *testing.T) {
+	const password = "backup-password"
+	backupSettings := newModel(nil, vaultData{}, settings{Language: "en"})
+	backupSettings.screen = backupSettingsScreen
+	backupSettings.formValues = []string{"", "0", "0", password, "", ""}
+	restoreBackup := newModel(nil, vaultData{}, settings{Language: "en"})
+	restoreBackup.screen, restoreBackup.formValues = restorePasswordScreen, []string{password}
+
+	for _, form := range []model{backupSettings, restoreBackup} {
+		if view := form.formView(); !strings.Contains(view, password) {
+			t.Fatalf("backup password should be visible: %q", view)
+		}
+	}
+
+	legacyVault := restoreBackup
+	legacyVault.restoreLegacyPassword = true
+	if view := legacyVault.formView(); strings.Contains(view, password) {
+		t.Fatalf("legacy vault password should remain masked: %q", view)
+	}
+}
+
 func TestRowsKeepSavedManualOrder(t *testing.T) {
 	model := newModel(nil, vaultData{
 		Groups:   []group{{ID: "second", Name: "Second"}, {ID: "first", Name: "First"}},
@@ -932,6 +953,37 @@ func TestWebDAVSettingsCanBeSavedBeforeBackupPassword(t *testing.T) {
 	}
 	if !restored.WebDAV.configured() || restored.WebDAV.URL != "https://example.test" || restored.WebDAV.Path != "ishell" || restored.WebDAV.Username != "alice" || restored.WebDAV.Password != "secret" {
 		t.Fatal("WebDAV settings were not persisted")
+	}
+}
+
+func TestBackupWithoutPasswordKeepsSavedWebDAVSettings(t *testing.T) {
+	dir := t.TempDir()
+	vaultPassword := []byte("vault-password")
+	salt := bytes.Repeat([]byte{1}, 16)
+	s := &store{dir: dir, vaultPath: filepath.Join(dir, "vault.json"), settingsPath: filepath.Join(dir, "settings.json"), key: deriveKey(vaultPassword, salt), salt: salt, password: true}
+	m := newModel(s, vaultData{}, settings{Language: "en"})
+	m.screen, m.formField, m.formValues = backupSettingsScreen, 4, m.backupFormValues()
+
+	updated, _ := m.updateForm(tea.KeyMsg{Type: tea.KeyEnter})
+	webDAV := updated.(model)
+	webDAV.formValues = []string{"enabled", "https://example.test", "ishell", "alice", "secret", "Test configuration", "Cloud backups"}
+	webDAV.formField = len(webDAV.formValues)
+	updated, _ = webDAV.updateForm(tea.KeyMsg{Type: tea.KeyEnter})
+	backup := updated.(model)
+	if backup.screen != backupSettingsScreen || !backup.data.WebDAV.configured() || backup.data.BackupPassword != "" {
+		t.Fatalf("WebDAV save before backup password = %#v", backup)
+	}
+
+	updated, _ = backup.updateForm(tea.KeyMsg{Type: tea.KeyCtrlB})
+	updated, _ = updated.(model).updateForm(tea.KeyMsg{Type: tea.KeyEnter})
+	updated, _ = updated.(model).updateForm(tea.KeyMsg{Type: tea.KeyEnter})
+	result := updated.(model)
+	if !strings.Contains(result.message, "set a backup password") {
+		t.Fatalf("backup without password should fail: %#v", result)
+	}
+	restored, err := s.unlock(vaultPassword)
+	if err != nil || !restored.WebDAV.configured() || restored.WebDAV.URL != "https://example.test" {
+		t.Fatalf("backup failure cleared saved WebDAV settings: %#v, %v", restored.WebDAV, err)
 	}
 }
 
