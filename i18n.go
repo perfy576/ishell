@@ -33,6 +33,10 @@ var translations = map[string]map[string]string{
 
 var supplementalTranslations = map[string]map[string]string{
 	"en": {
+		"cancel":                         "Cancel",
+		"backup":                         "Back up",
+		"restore":                        "Restore",
+		"delete":                         "Delete",
 		"backup_label_title":             "Backup label",
 		"backup_label_field":             "Label (empty uses manual)",
 		"backup_label_invalid":           "Backup label is invalid: ",
@@ -64,6 +68,10 @@ var supplementalTranslations = map[string]map[string]string{
 		"vault_password_changed":         "Vault password changed.",
 	},
 	"zh": {
+		"cancel":                         "\u53d6\u6d88",
+		"backup":                         "\u5907\u4efd",
+		"restore":                        "\u6062\u590d",
+		"delete":                         "\u5220\u9664",
 		"backup_label_title":             "\u5907\u4efd\u6807\u8bb0",
 		"backup_label_field":             "\u6807\u8bb0\uff08\u7559\u7a7a\u4f7f\u7528 manual\uff09",
 		"backup_label_invalid":           "\u5907\u4efd\u6807\u8bb0\u65e0\u6548\uff1a",

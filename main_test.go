@@ -165,6 +165,78 @@ func TestRemoteInitCommandKeepsScriptOutOfShellSyntax(t *testing.T) {
 	}
 }
 
+func TestSessionScriptSelectionUsesExplicitSaveAndCancel(t *testing.T) {
+	newSessionForm := func(directory string) (model, *store) {
+		vaultPassword := []byte("vault-password")
+		salt := bytes.Repeat([]byte{1}, 16)
+		store := &store{dir: directory, vaultPath: filepath.Join(directory, "vault.json"), key: deriveKey(vaultPassword, salt), salt: salt, password: true}
+		model := newModel(store, vaultData{Scripts: []initScript{{ID: "script", Name: "Setup", Interpreter: "sh", Content: "cd /srv"}}}, settings{Language: "en"})
+		model.screen, model.formField = sessionFormScreen, 6
+		model.formValues = []string{"Production", "ssh", "example.test", "deploy", "22", "", ""}
+		return model, store
+	}
+
+	cancelledForm, _ := newSessionForm(t.TempDir())
+	updated, _ := cancelledForm.updateForm(tea.KeyMsg{Type: tea.KeyEnter})
+	picker := updated.(model)
+	picker.cursor = 2
+	updated, _ = picker.updateScriptPicker(tea.KeyMsg{Type: tea.KeyEnter})
+	draft := updated.(model)
+	if draft.formField != len(draft.formValues) || draft.formValues[6] != "script" {
+		t.Fatalf("selected script should focus the explicit save action: %#v", draft)
+	}
+	if view := draft.formView(); !strings.Contains(view, "[Save]") || !strings.Contains(view, "[Cancel]") {
+		t.Fatalf("session form actions missing from view: %q", view)
+	}
+	updated, _ = draft.updateForm(tea.KeyMsg{Type: tea.KeyEsc})
+	if result := updated.(model); result.screen != menuScreen || len(result.data.Sessions) != 0 {
+		t.Fatalf("Esc should cancel the selected script draft: %#v", result)
+	}
+
+	savedForm, savedStore := newSessionForm(t.TempDir())
+	updated, _ = savedForm.updateForm(tea.KeyMsg{Type: tea.KeyEnter})
+	picker = updated.(model)
+	picker.cursor = 2
+	updated, _ = picker.updateScriptPicker(tea.KeyMsg{Type: tea.KeyEnter})
+	updated, _ = updated.(model).updateForm(tea.KeyMsg{Type: tea.KeyEnter})
+	result := updated.(model)
+	if result.screen != menuScreen || len(result.data.Sessions) != 1 || result.data.Sessions[0].InitScriptID != "script" {
+		t.Fatalf("explicit save did not persist the selected script: %#v", result)
+	}
+	stored, err := savedStore.unlock([]byte("vault-password"))
+	if err != nil || len(stored.Sessions) != 1 || stored.Sessions[0].InitScriptID != "script" {
+		t.Fatalf("saved session did not persist to the vault: %v", err)
+	}
+}
+
+func TestMutationFormsExposePrimaryAndCancelActions(t *testing.T) {
+	cases := []struct {
+		screen  screen
+		values  []string
+		primary string
+	}{
+		{sessionFormScreen, []string{"", "ssh", "", "", "22", "", ""}, "Save"},
+		{groupFormScreen, []string{""}, "Save"},
+		{commandFormScreen, []string{"", ""}, "Save"},
+		{commandGroupFormScreen, []string{""}, "Save"},
+		{backupSettingsScreen, []string{"", "0", "0", "", "Disabled", ""}, "Save"},
+		{backupLabelScreen, []string{""}, "Back up"},
+		{webDAVSettingsScreen, []string{"disabled", "", "", "", "", "Test configuration", "Cloud backups"}, "Save"},
+		{languageSettingsScreen, []string{"auto"}, "Save"},
+		{changeVaultPasswordScreen, []string{"", "", ""}, "Save"},
+		{restorePasswordScreen, []string{""}, "Restore"},
+		{scriptFormScreen, []string{"", "sh", ""}, "Save"},
+	}
+	for _, value := range cases {
+		m := newModel(nil, vaultData{}, settings{Language: "en"})
+		m.screen, m.formValues = value.screen, value.values
+		view := m.formView()
+		if !strings.Contains(view, "["+value.primary+"]") || !strings.Contains(view, "[Cancel]") {
+			t.Fatalf("screen %d actions missing from view: %q", value.screen, view)
+		}
+	}
+}
+
 func TestRowsKeepSavedManualOrder(t *testing.T) {
 	model := newModel(nil, vaultData{
 		Groups:   []group{{ID: "second", Name: "Second"}, {ID: "first", Name: "First"}},
@@ -432,6 +504,24 @@ func TestDeleteQuickCommandAndProtectNonEmptyCommandGroup(t *testing.T) {
 	result := updated.(model)
 	if len(result.data.CommandGroups) != 1 || result.message == "" {
 		t.Fatalf("non-empty command group should not be deleted: %#v", result)
+	}
+}
+
+func TestConfirmationViewsExposeExplicitCancelAction(t *testing.T) {
+	m := newModel(nil, vaultData{}, settings{Language: "en"})
+	m.pending = menuRow{label: "Connection"}
+	m.restorePath = "/tmp/backup.zip"
+	m.pendingCloudBackup = webDAVArchive{Name: "backup.zip"}
+	for _, view := range []string{m.confirmView(), m.restoreConfirmView(), m.webDAVRestoreConfirmView(), m.webDAVDeleteConfirmView()} {
+		if !strings.Contains(view, "[Cancel]") {
+			t.Fatalf("confirmation view has no cancel action: %q", view)
+		}
+	}
+	m.screen, m.confirmAction = confirmScreen, 0
+	updated, _ := m.updateConfirm(tea.KeyMsg{Type: tea.KeyDown})
+	updated, _ = updated.(model).updateConfirm(tea.KeyMsg{Type: tea.KeyEnter})
+	if result := updated.(model); result.screen != menuScreen {
+		t.Fatalf("selected cancel action should leave confirmation without changes: %#v", result)
 	}
 }
 
@@ -756,6 +846,7 @@ func TestManualBackupEmptyLabelDoesNotPanic(t *testing.T) {
 	m.screen, m.formValues = backupSettingsScreen, m.backupFormValues()
 	updated, _ := m.updateForm(tea.KeyMsg{Type: tea.KeyCtrlB})
 	updated, _ = updated.(model).updateForm(tea.KeyMsg{Type: tea.KeyEnter})
+	updated, _ = updated.(model).updateForm(tea.KeyMsg{Type: tea.KeyEnter})
 	result := updated.(model)
 	if result.screen != backupSettingsScreen || result.message == "" {
 		t.Fatalf("empty manual backup result = %#v", result)
@@ -805,14 +896,18 @@ func TestWebDAVSettingsUseNestedScreenAndHaveToggle(t *testing.T) {
 	s := &store{settingsPath: filepath.Join(t.TempDir(), "settings.json")}
 	m := newModel(s, vaultData{WebDAV: webDAVConfig{URL: "https://example.test"}}, settings{})
 	m.screen, m.formField, m.formValues = backupSettingsScreen, 4, m.backupFormValues()
+	m.formValues[3] = "draft-password"
 
 	updated, _ := m.updateForm(tea.KeyMsg{Type: tea.KeyEnter})
 	nested := updated.(model)
-	if nested.screen != webDAVSettingsScreen || len(nested.formValues) != 8 {
+	if nested.screen != webDAVSettingsScreen || len(nested.formValues) != 7 {
 		t.Fatalf("WebDAV configuration should open in its own screen: %#v", nested)
 	}
 	if nested.formValues[0] != "enabled" {
 		t.Fatalf("legacy configuration should open as enabled, got %q", nested.formValues[0])
+	}
+	if nested.data.BackupPassword != "" || len(nested.backupFormDraft) != 6 || nested.backupFormDraft[3] != "draft-password" {
+		t.Fatalf("opening WebDAV settings should preserve, not save, the backup draft: %#v", nested)
 	}
 
 	updated, _ = nested.updateForm(tea.KeyMsg{Type: tea.KeyLeft})
@@ -827,7 +922,7 @@ func TestWebDAVSettingsCanBeSavedBeforeBackupPassword(t *testing.T) {
 	salt := bytes.Repeat([]byte{1}, 16)
 	s := &store{dir: dir, vaultPath: filepath.Join(dir, "vault.json"), key: deriveKey(vaultPassword, salt), salt: salt, password: true}
 	m := newModel(s, vaultData{}, settings{})
-	m.formValues = []string{"enabled", "https://example.test", "ishell", "alice", "secret", "Test configuration", "Cloud backups", "Save"}
+	m.formValues = []string{"enabled", "https://example.test", "ishell", "alice", "secret", "Test configuration", "Cloud backups"}
 	if err := m.saveWebDAVSettings(); err != nil {
 		t.Fatalf("save WebDAV settings before setting backup password: %v", err)
 	}
@@ -843,7 +938,7 @@ func TestWebDAVSettingsCanBeSavedBeforeBackupPassword(t *testing.T) {
 func TestWebDAVFocusChangeClearsTestMessage(t *testing.T) {
 	m := newModel(nil, vaultData{}, settings{})
 	m.screen, m.formField = webDAVSettingsScreen, 5
-	m.formValues = []string{"enabled", "https://example.test", "", "", "", "Test configuration", "Cloud backups", "Save"}
+	m.formValues = []string{"enabled", "https://example.test", "", "", "", "Test configuration", "Cloud backups"}
 	m.message = "WebDAV test succeeded."
 	updated, _ := m.updateForm(tea.KeyMsg{Type: tea.KeyDown})
 	result := updated.(model)
@@ -867,13 +962,21 @@ func TestCloudBackupsUsesCurrentWebDAVFormConfiguration(t *testing.T) {
 	s := &store{dir: dir, vaultPath: filepath.Join(dir, "vault.json"), key: bytes.Repeat([]byte{1}, 32), salt: bytes.Repeat([]byte{2}, 16), password: true}
 	m := newModel(s, vaultData{BackupPassword: "backup-password"}, settings{})
 	m.screen, m.formField = webDAVSettingsScreen, 6
-	m.formValues = []string{"enabled", server.URL, "ishell", "", "", "Test configuration", "Cloud backups", "Save"}
+	m.formValues = []string{"enabled", server.URL, "ishell", "", "", "Test configuration", "Cloud backups"}
 	updated, command := m.updateForm(tea.KeyMsg{Type: tea.KeyEnter})
 	if updated.(model).screen != webDAVBackupsScreen {
 		t.Fatal("cloud backup action should open the backup list")
 	}
 	if message, ok := command().(webDAVBackupsMsg); !ok || message.err != nil {
 		t.Fatalf("cloud backup list result = %#v", message)
+	}
+	if s.exists() {
+		t.Fatal("opening cloud backups should not save the WebDAV form")
+	}
+	updated, _ = updated.(model).updateWebDAVBackups(tea.KeyMsg{Type: tea.KeyEsc})
+	returned := updated.(model)
+	if returned.screen != webDAVSettingsScreen || returned.formField != 6 || returned.formValues[1] != server.URL || returned.cloudWebDAVConfigSet {
+		t.Fatalf("returning from cloud backups should restore the unsaved WebDAV draft: %#v", returned)
 	}
 }
 
