@@ -28,6 +28,10 @@ func main() {
 		runUpdate()
 		return
 	}
+	if len(os.Args) > 1 && os.Args[1] == "break" {
+		runBreak()
+		return
+	}
 	if len(os.Args) > 1 && os.Args[1] == "telnet" {
 		runTelnet(os.Args[2:])
 		return

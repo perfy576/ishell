@@ -42,7 +42,7 @@ func runUpdate() {
 	if err != nil {
 		fatal(err)
 	}
-	if !confirmTwice("Update iShell from v" + appVersion + " to " + release.TagName) {
+	if !confirm("Update iShell from v" + appVersion + " to " + release.TagName) {
 		return
 	}
 	archivePath, err := downloadReleaseAsset(asset)

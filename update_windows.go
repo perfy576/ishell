@@ -16,7 +16,7 @@ func replaceRunningExecutable(staged, target string) (string, error) {
 		return "", err
 	}
 	scriptPath := script.Name()
-	contents := fmt.Sprintf("@echo off\r\ntimeout /t 1 /nobreak >nul\r\nmove /y \"%s\" \"%s\" >nul\r\ndel /f /q \"%%~f0\"\r\n", staged, target)
+	contents := fmt.Sprintf("@echo off\r\n:retry\r\nmove /y \"%s\" \"%s\" >nul 2>nul\r\nif errorlevel 1 (\r\n  timeout /t 1 /nobreak >nul\r\n  goto retry\r\n)\r\ndel /f /q \"%%~f0\"\r\n", staged, target)
 	if _, err := script.WriteString(contents); err != nil {
 		script.Close()
 		os.Remove(scriptPath)
@@ -33,7 +33,7 @@ func replaceRunningExecutable(staged, target string) (string, error) {
 		os.Remove(scriptPath)
 		return "", err
 	}
-	return "Update downloaded. The selected iShell executable will be replaced after this process exits.", nil
+	return "Update downloaded. Run ishell break to disconnect active sessions; the selected executable will be replaced once they exit.", nil
 }
 
 func updateDestination(current string) (string, error) {
